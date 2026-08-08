@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+.oauth_request_state.json
+*.pem
+*.key
+credentials*.json
+
+# Generated portfolio / prompt output (may contain holdings)
+briefings/
+prompts/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
