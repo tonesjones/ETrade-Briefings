@@ -45,7 +45,8 @@ def _credentials():
     if not all([consumer_key, consumer_secret, access_token, access_token_secret]):
         raise ValueError(
             "Missing credentials in .env.\n"
-            "Make sure you have run etrade_auth.py and added the access tokens."
+            "Run etrade_auth.py (browser + verification code), then add the "
+            "access tokens. Tokens expire at midnight US Eastern — re-auth daily."
         )
 
     return {

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-One-time E*TRADE OAuth authorization script.
-Run this once to get your access tokens, then add them to .env
+E*TRADE OAuth authorization script.
+
+Run this to get access tokens, then add them to .env.
+
+IMPORTANT: E*TRADE access tokens expire at midnight US Eastern every day.
+You must re-run this (browser login + paste verification code + update .env)
+once per calendar day after expiry. Same-day portfolio fetches reuse .env tokens.
 
 READ-ONLY NOTE
 --------------
@@ -43,9 +48,10 @@ if not verifier:
 tokens = oauth.get_access_token(verifier)
 
 print("\n" + "=" * 60)
-print("SUCCESS! Add these two lines to your .env file:")
+print("SUCCESS! Replace these two lines in your .env file:")
 print("=" * 60)
 print(f"ETRADE_ACCESS_TOKEN={tokens['oauth_token']}")
 print(f"ETRADE_ACCESS_TOKEN_SECRET={tokens['oauth_token_secret']}")
 print("=" * 60)
-print("\nAfter adding them, run: python get_portfolio.py")
+print("\nTokens expire at midnight US Eastern — re-run this script after that.")
+print("Same day: no re-auth needed. Next: python build_briefing_prompt.py")

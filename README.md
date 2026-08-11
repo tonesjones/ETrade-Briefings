@@ -6,12 +6,24 @@ No xAI API key or API credits required.
 
 ---
 
-## Daily workflow (option 1 — recommended)
+## Daily workflow (recommended)
 
-**Best path:** build a **fully processed** briefing prompt (your hedge-fund instructions + live weights already filled in):
+E\*TRADE access tokens **expire every day at midnight US Eastern**. You must re-authorize in the browser **once per calendar day** (Eastern) before pulling data. Same-day re-runs of the portfolio script do **not** need another browser login.
+
+### 1. Re-auth (required after midnight ET, or if API rejects tokens)
 
 ```powershell
 cd C:\TestCode\Etrade-Grok
+python etrade_auth.py
+```
+
+1. Open the printed URL in your browser, log in, and authorize the app
+2. Paste the verification code into the terminal
+3. Copy the two printed lines into `.env` (replace the previous `ETRADE_ACCESS_TOKEN` / `ETRADE_ACCESS_TOKEN_SECRET`)
+
+### 2. Build the briefing prompt
+
+```powershell
 python build_briefing_prompt.py
 ```
 
@@ -33,6 +45,18 @@ python get_portfolio.py
 |---------|--------|
 | `build_briefing_prompt.py` | Full prompt → clipboard + `prompts/daily_briefing_prompt_YYYY-MM-DD.md` |
 | `get_portfolio.py` | Portfolio block → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` |
+
+---
+
+## Token lifetime (why re-auth is daily)
+
+| Situation | What you do |
+|-----------|-------------|
+| **First use, or any time after midnight US Eastern** | Full OAuth: `python etrade_auth.py` → browser → paste code → update `.env` |
+| **Same day, tokens still working** | Just run `build_briefing_prompt.py` / `get_portfolio.py` — no browser |
+| **API rejects tokens** (expired or invalid) | Run `etrade_auth.py` again and update `.env` |
+
+This is an E\*TRADE platform rule, not something this repo can skip. Consumer key/secret stay in `.env` permanently; only the **access** token pair must be refreshed after daily expiry.
 
 ---
 
@@ -59,13 +83,14 @@ ETRADE_CONSUMER_SECRET=...
 ETRADE_DEV=true          # sandbox; use false for production
 ```
 
-### 3. One-time OAuth
+### 3. First OAuth (then again after each midnight ET)
 
 ```powershell
 python etrade_auth.py
 ```
 
-Authorize in the browser, paste the verification code, then put the printed access tokens into `.env`.
+Authorize in the browser, paste the verification code, then put the printed access tokens into `.env`.  
+See [Daily workflow](#daily-workflow-recommended) — you will repeat this step **once per day** after tokens expire.
 
 ### 4. Accounts
 
@@ -80,7 +105,7 @@ Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
 |------|------|
 | `build_briefing_prompt.py` | **Daily command** — live portfolio + full processed prompt → clipboard |
 | `get_portfolio.py` | Portfolio block only (fetch, format, clipboard, save) |
-| `etrade_auth.py` | One-time OAuth (tokens only) |
+| `etrade_auth.py` | OAuth (browser + code) — **once per day after midnight ET** |
 | `.env` | Secrets (gitignored) |
 | `.env.example` | Template for secrets |
 | `briefings/` | Dated portfolio blocks (gitignored) |
@@ -106,9 +131,9 @@ This project is intentionally **read-only** against E\*TRADE:
 
 ## Tips
 
-- Re-run OAuth if E*TRADE starts rejecting tokens.
+- **Daily habit:** after midnight ET → `python etrade_auth.py` (browser + code → update `.env`) → `python build_briefing_prompt.py` → grok.com → Ctrl+V.
+- Same calendar day (US Eastern): re-run the portfolio script without re-auth unless the API rejects tokens.
 - Production: `ETRADE_DEV=false` with LIVE consumer key/secret in `.env`.
-- Daily habit: `python build_briefing_prompt.py` → grok.com → Ctrl+V.
 - Optional SNPS mark: `SNPS_MARKET_VALUE=60000` in `.env`.
 
 ---
