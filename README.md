@@ -1,6 +1,8 @@
 # E*TRADE → Daily Portfolio Action Briefing
 
-Pulls live E*TRADE positions (all active accounts), builds a **fully processed** briefing prompt with current weights/values, **copies it to your clipboard**, and saves a dated file. You paste into **grok.com** using your normal Grok/SuperGrok plan.
+Pulls live E*TRADE positions (all active accounts), builds a **decision-engine** briefing prompt (executive trades first, tax/lot hierarchy, factor sleeves), **copies it to your clipboard**, and saves a dated file. You paste into **grok.com** using your normal Grok/SuperGrok plan.
+
+Each holding includes E\*TRADE **price paid**, **cost per share**, **total cost**, **unrealized P/L**, and **date acquired**. Taxable lots are labeled **ST** (held ≤ 1 year) or **LT** (held > 1 year). IRA/Roth show economic P/L but are **not** treated as capital-gains events. The prompt also pre-computes **direct AI/semi** vs **broad AI-cycle** weights so concentration is not just the six chip tickers.
 
 No xAI API key or API credits required.
 
@@ -121,7 +123,7 @@ This project is intentionally **read-only** against E\*TRADE:
 |---------|---------------------------|
 | OAuth login (`etrade_auth.py`) | `ETradeOrder` (place / preview / cancel orders) |
 | `list_accounts` | Market order helpers used to trade |
-| `get_account_portfolio` | Any auto-submit of buys/sells |
+| `get_account_portfolio` (including cost basis / lots) | Any auto-submit of buys/sells |
 
 - Grok recommendations in the briefing prompt are **text only**. Nothing in this repo sends those actions to E\*TRADE.
 - You would have to place trades yourself in the E\*TRADE UI (or deliberately add order code later).
@@ -132,9 +134,10 @@ This project is intentionally **read-only** against E\*TRADE:
 ## Tips
 
 - **Daily habit:** after midnight ET → `python etrade_auth.py` (browser + code → update `.env`) → `python build_briefing_prompt.py` → grok.com → Ctrl+V.
+- Cost basis: the script pulls E\*TRADE average cost, total cost, unrealized P/L, and **tax lots** (so mixed ST/LT names are split correctly). That adds a few extra read-only lot calls and a few seconds.
 - Same calendar day (US Eastern): re-run the portfolio script without re-auth unless the API rejects tokens.
 - Production: `ETRADE_DEV=false` with LIVE consumer key/secret in `.env`.
-- Optional SNPS mark: `SNPS_MARKET_VALUE=60000` in `.env`.
+- Optional SNPS mark: `SNPS_MARKET_VALUE=60000` in `.env`. Optional tradable sleeve: `SNPS_TRADABLE_VALUE=...` and `SNPS_RESTRICTIONS=blackout` — otherwise the prompt treats SNPS tradability as unknown.
 
 ---
 
