@@ -21,6 +21,7 @@ from get_portfolio import (
     fetch_portfolio_block,
     format_cost_suffix,
     format_taxable_cost_table,
+    is_cash_symbol,
     save_portfolio_block,
 )
 
@@ -40,6 +41,14 @@ BROAD_INDEX = ("VOO",)
 # Employer SNPS sleeve (not in E*TRADE liquid pull; include in full analysis)
 # Override with SNPS_MARKET_VALUE in .env if the mark changes
 DEFAULT_SNPS_MARKET_VALUE = 60_000.0
+
+# Position table: ≥ 2.5% is the default. Below that, still force harvest
+# candidates and material losers (TE / BMNR class). Ignore stubs under $5k.
+ANALYZE_WEIGHT_FLOOR = 2.5
+ANALYZE_MV_FLOOR = 5_000.0
+MATERIAL_LOSS_DOLLARS = -5_000.0
+MATERIAL_LOSS_PCT = -20.0
+HARVEST_LOSS_DOLLARS = -250.0  # match collect_tax_flags
 
 # Friendly names for a few tickers in the prompt
 ALIASES = {
@@ -189,6 +198,77 @@ def sleeve_stats(holdings: list[dict], symbols: tuple[str, ...], total: float):
     mv = sum(h["market_value"] for h in members)
     w = (mv / total * 100) if total else 0.0
     return mv, w, [h["symbol"] for h in members]
+
+
+def must_analyze_holdings(holdings: list[dict]) -> list[dict]:
+    """Names that must appear in the briefing position table.
+
+    Default is weight ≥ 2.5%. Also include taxable harvest candidates and
+    material economic losers even when they sit under that line — that is
+    what dropped TE and BMNR. Stubs under $5k (IBM) stay out.
+    """
+    out = []
+    for h in holdings:
+        sym = h.get("symbol") or ""
+        if is_cash_symbol(sym):
+            continue
+        reasons: list[str] = []
+        mv = h.get("market_value") or 0.0
+        if (h.get("weight") or 0.0) >= ANALYZE_WEIGHT_FLOOR:
+            reasons.append("weight")
+        tg = h.get("total_gain")
+        tgp = h.get("total_gain_pct")
+        taxable_mv = h.get("taxable_mv") or 0.0
+        sized = mv >= ANALYZE_MV_FLOOR
+        if (
+            sized
+            and taxable_mv > 0
+            and tg is not None
+            and tg < HARVEST_LOSS_DOLLARS
+        ):
+            reasons.append("harvest")
+        if sized and tg is not None and (
+            tg <= MATERIAL_LOSS_DOLLARS
+            or (tgp is not None and tgp <= MATERIAL_LOSS_PCT)
+        ):
+            reasons.append("loss")
+        if reasons:
+            row = dict(h)
+            row["analyze_reasons"] = reasons
+            out.append(row)
+    return out
+
+
+def format_must_analyze(rows: list[dict]) -> str:
+    weight = [r["symbol"] for r in rows if "weight" in r["analyze_reasons"]]
+    extra = [r for r in rows if "weight" not in r["analyze_reasons"]]
+    lines = []
+    if weight:
+        lines.append("- Weight ≥ 2.5%: " + ", ".join(weight))
+    if extra:
+        bits = []
+        for r in extra:
+            tags = []
+            if "harvest" in r["analyze_reasons"]:
+                tags.append("taxable harvest")
+            tgp = r.get("total_gain_pct")
+            tg = r.get("total_gain")
+            if "loss" in r["analyze_reasons"]:
+                if tgp is not None:
+                    tags.append(f"{tgp:+.0f}%")
+                elif tg is not None:
+                    tags.append(fmt_money(tg))
+            label = r["symbol"]
+            if tags:
+                label += f" ({', '.join(tags)})"
+            bits.append(label)
+        lines.append(
+            "- Below 2.5% but harvest / material loss: " + ", ".join(bits)
+        )
+    lines.append("- Always: SNPS")
+    all_syms = [r["symbol"] for r in rows] + ["SNPS"]
+    lines.append("- **Do not skip:** " + ", ".join(all_syms))
+    return "\n".join(lines)
 
 
 def _env_money(name: str):
@@ -576,6 +656,8 @@ def build_prompt(
         f"(~{fmt_weight(snps_w_econ)} of economic total; "
         f"~{fmt_weight(snps_w_liquid)} vs liquid book alone)"
     )
+    analyze_rows = must_analyze_holdings(holdings)
+    must_analyze_block = format_must_analyze(analyze_rows)
 
     if cluster_w >= 40:
         cluster_status = (
@@ -698,6 +780,9 @@ Use the “As of” stamp below for marks. Do not invent prices, cost, dates, or
 
 {holdings_lines}
 
+**Must-analyze for the position table (pre-computed — do not skip):**
+{must_analyze_block}
+
 **Cost / lots (E*TRADE):** `avg` = cost/share (else price paid). `cost` = dollars in. `P/L` = unrealized vs that cost. Taxable **ST** = held ≤ 1 year; **LT** = held > 1 year. Mixed lots show both. IRA/Roth: economic P/L only — **not** capital-gains events. Same ticker in two accounts is two decision buckets. SNPS cost/date is not in this pull.
 
 **Taxable lot table (ST/LT source of truth for the brokerage):**
@@ -770,7 +855,7 @@ Buy: why this $10k vs the best 2 names already held (usually VOO / a core compou
 
 **Replace** requires all of: what is reduced and why; the replacement; risk removed; new exposure introduced; tax/friction; why the replacement has superior expected risk-adjusted return. “Sell and hold cash” is **Reduce / Deploy**, not Replace.
 
-## Thesis vs price (names ≥ 2.5% + always SNPS)
+## Thesis vs price (must-analyze names + always SNPS)
 
 Score separately: thesis · valuation · trend · catalyst. “Great company” ≠ “attractive at this price.” Every action you touch must include a **horizon** (days / weeks / months / event-driven).
 
@@ -828,8 +913,8 @@ What changed vs the prior pull (use the pre-computed delta). Then 8–12 lines: 
 **2. Regime, catalysts, stress**  
 Only what **changes a decision**. Then a **directional** stress (no fake VaR): Nasdaq −10%; semi index −15%; AI-capex expectations fall; rates spike; broad correction *without* AI-specific damage. Which names drive the drawdown, what offsets. Qualitative unless you have real numbers.
 
-**3. Positions ≥ 2.5% + SNPS always**  
-Compact table: Action · horizon · last · avg/cost · P/L · term/account · thesis/valuation · target wt · one-line why. Tax-engine + two-sleeve compare **only** on Trim/Sell. Replace rows must pass the replacement test. Optional 1–3 new ideas if they pass factor + $10k.
+**3. Must-analyze positions (list in §1 — weight ≥ 2.5%, harvest, material losses, SNPS)**  
+Every ticker in that list gets a row. Do not omit a name because it is under 2.5% — that is how TE / BMNR-class names disappear. Compact table: Action · horizon · last · avg/cost · P/L · term/account · thesis/valuation · target wt · one-line why. Tax-engine + two-sleeve compare **only** on Trim/Sell. Replace rows must pass the replacement test. Optional 1–3 new ideas if they pass factor + $10k.
 
 **4. Cash, tax bill, post-trade book**  
 SGOV plan (now {fmt_money(cash_mv)}). If any trade: min-necessary $ vs $ recommended; estimated ST/LT tax; updated cash, top-5, direct %, broad %, $10k marginals of the trade. Directional Nasdaq beta: up / similar / down. **No fake expected-return or drawdown to one decimal.**
