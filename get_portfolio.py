@@ -11,6 +11,8 @@ READ-ONLY SAFEGUARD
 This module only uses pyetrade.ETradeAccounts for:
   - list_accounts
   - get_account_portfolio
+  - get_account_balance
+  - get portfolio tax lots
 It never imports or constructs ETradeOrder / market order helpers.
 No preview, place, cancel, or change-order calls exist in this repo.
 """
@@ -19,12 +21,16 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import subprocess
+import time
+from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import pyetrade
+from portfolio_policy import POLICY
 
 # Explicit allow-list: only the Accounts API surface is used (list + portfolio).
 # Do not import or construct pyetrade.ETradeOrder — trading is intentionally unsupported.
@@ -39,7 +45,17 @@ try:
 except Exception:
     ET = datetime.now().astimezone().tzinfo
 
-CASH_SYMBOLS = {"SGOV", "BIL", "SGOVX"}
+CASH_SYMBOLS = POLICY.cash_symbols
+# Residual NAV-vs-mark gaps below this are noise, not sweep cash.
+CASH_RESIDUAL_FLOOR = 1.0
+LOGGER = logging.getLogger(__name__)
+
+class PortfolioDataError(RuntimeError):
+    """The API response was incomplete or could not be validated."""
+
+
+class IncompletePortfolioError(PortfolioDataError):
+    """One or more selected accounts could not be loaded completely."""
 
 
 def _first(d, *keys, default=None):
@@ -67,7 +83,30 @@ def _as_float(val, default=None):
 
 
 def is_cash_symbol(symbol: str) -> bool:
-    return symbol in CASH_SYMBOLS or "GOVERNMENT" in (symbol or "").upper()
+    normalized = (symbol or "").upper()
+    return normalized in CASH_SYMBOLS or "GOVERNMENT" in normalized
+
+
+def now_et() -> datetime:
+    """Return an aware timestamp in E*TRADE calendar timezone."""
+    return datetime.now(ET)
+
+
+def _status_code(exc: Exception) -> int | None:
+    return getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _retry_read(call, attempts: int = 3):
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            status = _status_code(exc)
+            transient = status is None or status == 429 or (status is not None and status >= 500)
+            if not transient or attempt == attempts:
+                raise
+            LOGGER.warning("Transient E*TRADE read failed (%s/%s): %s", attempt, attempts, exc)
+            time.sleep(0.25 * (2 ** (attempt - 1)))
 
 
 def to_et(dt: datetime) -> datetime:
@@ -125,7 +164,8 @@ def tax_bucket_from_account(acct: dict) -> str:
     ).upper()
     if "ROTH" in blob:
         return "roth"
-    if "IRA" in blob or "CONTRIBUTORY" in blob or "TRADITIONAL" in blob:
+    retirement = ("IRA", "CONTRIBUTORY", "TRADITIONAL", "401K", "401(K)", "403B", "403(B)", "SEP", "SIMPLE", "PENSION", "RETIREMENT", "COVERDELL", "MONEY_PURCHASE", "PROFIT_SHARING", "INDIVIDUAL_K")
+    if any(marker in blob for marker in retirement):
         return "traditional"
     return "taxable"
 
@@ -183,13 +223,16 @@ def parse_lots_response(raw) -> list[dict]:
 
 
 def fetch_position_lots(accounts_api, lots_url: str) -> list[dict]:
-    """READ: tax lots for one position. Uses the Accounts portfolio-lot URL."""
-    req = accounts_api.session.get(lots_url)
-    req.raise_for_status()
-    return parse_lots_response(req.json())
+    """READ: tax lots for one position."""
+    def request():
+        response = accounts_api.session.get(lots_url, timeout=15)
+        response.raise_for_status()
+        return parse_lots_response(response.json())
+
+    return _retry_read(request)
 
 
-def attach_lots(accounts_api, holdings, verbose: bool = False) -> None:
+def attach_lots(accounts_api, holdings, verbose: bool = False, strict: bool = True) -> None:
     """Fill holding['lots'] from lotsDetails when the portfolio view omitted them."""
     pending = [
         h for h in holdings
@@ -199,12 +242,16 @@ def attach_lots(accounts_api, holdings, verbose: bool = False) -> None:
     ]
     if verbose and pending:
         print(f"  Fetching tax lots for {len(pending)} position(s)...")
+    failures = []
     for h in pending:
         try:
             h["lots"] = fetch_position_lots(accounts_api, h["lots_details"])
-        except Exception as e:
+        except Exception as exc:
+            failures.append(f"{h.get('symbol')}: {exc}")
             if verbose:
-                print(f"  Could not load lots for {h.get('symbol')}: {e}")
+                print(f"  Could not load lots for {h.get('symbol')}: {exc}")
+    if failures and strict:
+        raise PortfolioDataError("Could not load required tax lots: " + "; ".join(failures))
 
 
 def lot_term_split(holding: dict, as_of: datetime) -> dict:
@@ -463,7 +510,7 @@ def collect_tax_flags(results, as_of: datetime) -> list[str]:
                 st_gains.append(
                     f"{name} {fmt_signed_money(split['st_gain'] or (tg or 0))} ST"
                 )
-            if tg is not None and tg < -250:
+            if tg is not None and tg < POLICY.harvest_loss_dollars:
                 losses.append(f"{name} {fmt_signed_money(tg)}")
             if split["lt_gain"] > 2000 or (
                 split["term"] == "LT" and tg is not None and tg > 2000
@@ -512,8 +559,10 @@ def _credentials():
     if not all([consumer_key, consumer_secret, access_token, access_token_secret]):
         raise ValueError(
             "Missing credentials in .env.\n"
-            "Run etrade_auth.py (browser + verification code), then add the "
-            "access tokens. Tokens expire at midnight US Eastern — re-auth daily."
+            "Set ETRADE_CONSUMER_KEY and ETRADE_CONSUMER_SECRET, then run "
+            "python etrade_auth.py (browser + verification code). "
+            "That script updates the daily access tokens in .env. "
+            "Tokens expire at midnight US Eastern — re-run etrade_auth.py to refresh."
         )
 
     return {
@@ -546,17 +595,131 @@ def list_accounts(accounts_api=None):
     """READ: list brokerage accounts."""
     if accounts_api is None:
         accounts_api, _ = get_accounts_api()
-    return accounts_api.list_accounts(resp_format="json")
+    return _retry_read(lambda: accounts_api.list_accounts(resp_format="json"))
+
+
+def get_account_balance(account_id_key: str, account_type: str, accounts_api=None):
+    """READ: get authoritative account value, including actual cash."""
+    if accounts_api is None:
+        accounts_api, _ = get_accounts_api()
+    return _retry_read(lambda: accounts_api.get_account_balance(
+        account_id_key, account_type=account_type or None,
+        real_time=True, resp_format="json",
+    ))
+
+
+def _find_numeric_key(value, keys: tuple[str, ...]) -> float | None:
+    if isinstance(value, dict):
+        lower = {str(k).lower(): v for k, v in value.items()}
+        for key in keys:
+            found = _as_float(lower.get(key.lower()))
+            if found is not None:
+                return found
+        for child in value.values():
+            found = _find_numeric_key(child, keys)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_numeric_key(child, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def _direct_numeric(value, *keys) -> float | None:
+    if not isinstance(value, dict):
+        return None
+    return _as_float(_first(value, *keys))
+
+
+def parse_account_cash(resp: dict) -> float | None:
+    """Settled cash + money-market sweep from the balance payload, or None if absent."""
+    if not isinstance(resp, dict) or "BalanceResponse" not in resp:
+        return None
+    balance = resp["BalanceResponse"]
+    computed = _first(balance, "Computed", "computed") or {}
+    cash_obj = _first(balance, "Cash", "cash") or {}
+
+    cash_balance = _direct_numeric(computed, "cashBalance")
+    if cash_balance is None:
+        cash_balance = _direct_numeric(cash_obj, "cashBalance")
+    mmkt = _direct_numeric(computed, "moneyMktBalance")
+    if mmkt is None:
+        mmkt = _direct_numeric(cash_obj, "moneyMktBalance")
+    if cash_balance is not None or mmkt is not None:
+        return (cash_balance or 0.0) + (mmkt or 0.0)
+
+    net_cash = _direct_numeric(computed, "netCash")
+    if net_cash is None:
+        net_cash = _direct_numeric(cash_obj, "netCash")
+    return net_cash
+
+
+def cash_holding(amount: float) -> dict:
+    return {
+        "symbol": "CASH",
+        "quantity": amount,
+        "price": 1.0,
+        "market_value": amount,
+        "price_paid": None,
+        "cost_per_share": None,
+        "total_cost": None,
+        "total_gain": None,
+        "total_gain_pct": None,
+        "date_acquired": None,
+        "position_id": None,
+        "lots_details": None,
+        "lots": [],
+    }
+
+
+def apply_cash_lot(
+    holdings: list[dict],
+    *,
+    account_total: float,
+    position_total: float,
+    cash_from_balance: float | None,
+) -> None:
+    """Attach sweep cash. Do not treat NAV-versus-mark residuals as cash."""
+    if cash_from_balance is not None:
+        if abs(cash_from_balance) >= 0.01:
+            holdings.append(cash_holding(cash_from_balance))
+            holdings.sort(key=lambda h: h["market_value"], reverse=True)
+        return
+    residual = account_total - position_total
+    if residual >= CASH_RESIDUAL_FLOOR:
+        holdings.append(cash_holding(residual))
+        holdings.sort(key=lambda h: h["market_value"], reverse=True)
+
+
+def parse_account_balance(resp: dict) -> float:
+    if not isinstance(resp, dict) or "BalanceResponse" not in resp:
+        raise PortfolioDataError("Unrecognized account balance response")
+    balance = resp["BalanceResponse"]
+    total = _find_numeric_key(balance, ("totalAccountValue",))
+    if total is not None:
+        return total
+    net_mv = _find_numeric_key(balance, ("netMv",))
+    net_cash = _find_numeric_key(balance, ("netCash",))
+    if net_mv is not None and net_cash is not None:
+        return net_mv + net_cash
+    raise PortfolioDataError(
+        "Account balance response has neither totalAccountValue nor netMv + netCash"
+    )
 
 
 def parse_account_list(resp):
-    """Return list of account dicts from list_accounts response."""
+    """Return a normalized list of account dictionaries."""
     try:
-        return resp["AccountListResponse"]["Accounts"]["Account"]
-    except (KeyError, TypeError):
-        print("Unexpected account list structure:")
-        print(json.dumps(resp, indent=2))
-        raise
+        accounts = resp["AccountListResponse"]["Accounts"]["Account"]
+    except (KeyError, TypeError) as exc:
+        raise PortfolioDataError("Unrecognized account list response") from exc
+    if isinstance(accounts, dict):
+        accounts = [accounts]
+    if not isinstance(accounts, list) or any(not isinstance(a, dict) for a in accounts):
+        raise PortfolioDataError("Account list did not contain account objects")
+    return accounts
 
 
 def get_portfolio(account_id_key: str, accounts_api=None, lots_required: bool = True):
@@ -571,24 +734,30 @@ def get_portfolio(account_id_key: str, accounts_api=None, lots_required: bool = 
         resp_format="json",
     )
     try:
-        return accounts_api.get_account_portfolio(account_id_key, **kwargs)
+        return _retry_read(lambda: accounts_api.get_account_portfolio(account_id_key, **kwargs))
     except Exception:
         if not lots_required:
             raise
-        # Lots are optional — fall back to position-level cost fields only.
+        # COMPLETE+lots view may be retried without lots_required.
+        # Per-position lot fetches in attach_lots(..., strict=True) remain required.
         kwargs["lots_required"] = False
-        return accounts_api.get_account_portfolio(account_id_key, **kwargs)
+        return _retry_read(lambda: accounts_api.get_account_portfolio(account_id_key, **kwargs))
 
 
 def extract_holdings(portfolio_resp):
     """Parse portfolio response into holdings list and total value."""
     try:
-        account_portfolio = portfolio_resp["PortfolioResponse"]["AccountPortfolio"][0]
+        portfolios = portfolio_resp["PortfolioResponse"]["AccountPortfolio"]
+        if isinstance(portfolios, dict):
+            portfolios = [portfolios]
+        account_portfolio = portfolios[0]
         positions = account_portfolio.get("Position", [])
         if isinstance(positions, dict):
             positions = [positions]
-    except (KeyError, IndexError, TypeError):
-        return [], 0.0
+        if not isinstance(positions, list):
+            raise TypeError("Position must be a list or object")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise PortfolioDataError("Unrecognized portfolio response") from exc
 
     holdings = []
     total_value = 0.0
@@ -598,16 +767,13 @@ def extract_holdings(portfolio_resp):
             product = _first(pos, "Product", "product") or {}
             symbol = _first(product, "symbol")
             if not symbol:
-                continue
+                raise PortfolioDataError("Portfolio position has no symbol")
             quantity = _as_float(_first(pos, "quantity"), 0.0) or 0.0
             market_value = _as_float(_first(pos, "marketValue"), 0.0) or 0.0
             quick = _first(pos, "Quick", "quick") or {}
             price = _as_float(_first(quick, "lastTrade"), 0.0) or (
                 _as_float(_first(pos, "price"), 0.0) or 0.0
             ) or (market_value / quantity if quantity else 0.0)
-
-            if market_value < 50:
-                continue
 
             price_paid = _as_float(_first(pos, "pricePaid"))
             cost_per_share = _as_float(_first(pos, "costPerShare"))
@@ -638,8 +804,8 @@ def extract_holdings(portfolio_resp):
                 "lots": extract_lots(pos),
             })
             total_value += market_value
-        except Exception:
-            continue
+        except (TypeError, ValueError) as exc:
+            raise PortfolioDataError("Could not parse a portfolio position") from exc
 
     holdings.sort(key=lambda x: x["market_value"], reverse=True)
     return holdings, total_value
@@ -668,7 +834,7 @@ def account_label(acct: dict) -> str:
 
 
 def format_holdings_lines(holdings, total_value, as_of=None, tax_bucket: str = "taxable"):
-    as_of = as_of or datetime.now()
+    as_of = as_of or now_et()
     lines = []
     for h in holdings:
         weight = (h["market_value"] / total_value * 100) if total_value > 0 else 0
@@ -690,13 +856,14 @@ def format_all_for_briefing(account_results, as_of: datetime | None = None):
     account_results: list of dicts with keys:
       label, holdings, total_value, account_id_key, error (optional)
     """
-    as_of = as_of or datetime.now()
+    as_of = as_of or now_et()
     now = as_of.strftime("%Y-%m-%d %H:%M")
     grand_total = sum(r["total_value"] for r in account_results if not r.get("error"))
-    total_positions = sum(len(r["holdings"]) for r in account_results if not r.get("error"))
+    total_positions = sum(sum(1 for h in r["holdings"] if h.get("symbol") != "CASH") for r in account_results if not r.get("error"))
 
     lines = []
-    lines.append(f"**Portfolio (live from E*TRADE – {now} PDT)**")
+    zone = as_of.tzname() or "ET"
+    lines.append(f"**Portfolio (live from E*TRADE – {now} {zone})**")
     lines.append(f"Total across all accounts ≈ ${grand_total:,.0f}")
     lines.append(
         f"Accounts included: {sum(1 for r in account_results if not r.get('error'))}"
@@ -715,7 +882,7 @@ def format_all_for_briefing(account_results, as_of: datetime | None = None):
 
         lines.append(f"### {r['label']} — ≈ ${r['total_value']:,.0f}")
         if not r["holdings"]:
-            lines.append("_No positions above $50_\n")
+            lines.append("_No positions_\n")
             continue
 
         lines.extend(
@@ -728,9 +895,6 @@ def format_all_for_briefing(account_results, as_of: datetime | None = None):
         )
         lines.append("")
 
-    lines.append(
-        "Employer: ≈ $60k SNPS (include in analysis; action allowed if price/thesis warrants)"
-    )
     return "\n".join(lines), grand_total, total_positions
 
 
@@ -753,12 +917,12 @@ def select_accounts(all_accts, account_id_key=None):
     return [a for a in all_accts if a.get("accountStatus", "").upper() == "ACTIVE"]
 
 
-def fetch_portfolio_block(verbose: bool = True):
+def fetch_portfolio_block(verbose: bool = True, allow_partial: bool = False):
     """
     Fetch all (or one) account portfolios and return:
       formatted_block, grand_total, total_positions, results, as_of
     """
-    as_of = datetime.now()
+    as_of = now_et()
     accounts_api, creds = get_accounts_api()
 
     if verbose:
@@ -787,8 +951,16 @@ def fetch_portfolio_block(verbose: bool = True):
             print(f"Fetching portfolio: {label}...")
         try:
             raw = get_portfolio(key, accounts_api)
-            holdings, total = extract_holdings(raw)
-            attach_lots(accounts_api, holdings, verbose=verbose)
+            holdings, position_total = extract_holdings(raw)
+            attach_lots(accounts_api, holdings, verbose=verbose, strict=True)
+            balance_raw = get_account_balance(key, a.get("accountType") or "", accounts_api)
+            total = parse_account_balance(balance_raw)
+            apply_cash_lot(
+                holdings,
+                account_total=total,
+                position_total=position_total,
+                cash_from_balance=parse_account_cash(balance_raw),
+            )
             results.append({
                 "label": label,
                 "holdings": holdings,
@@ -808,21 +980,34 @@ def fetch_portfolio_block(verbose: bool = True):
                 "error": str(e),
             })
 
+    failures = [r for r in results if r.get("error")]
+    if failures and not allow_partial:
+        labels = ", ".join(r["label"] for r in failures)
+        raise IncompletePortfolioError(f"Portfolio generation stopped: incomplete account data for {labels}. Use --allow-partial only if you accept incorrect weights.")
     formatted, grand_total, total_positions = format_all_for_briefing(results, as_of=as_of)
+    if failures:
+        formatted = "**INCOMPLETE DATA — do not use for trade sizing.**\n\n" + formatted
     return formatted, grand_total, total_positions, results, as_of
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Atomically replace a UTF-8 text artifact."""
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(text, encoding="utf-8")
+    temp.replace(path)
 
 
 def save_portfolio_block(formatted: str, as_of: datetime | None = None) -> Path:
     """Write dated + latest portfolio block files under briefings/."""
-    as_of = as_of or datetime.now()
+    as_of = as_of or now_et()
     date_str = as_of.strftime("%Y-%m-%d")
     out_dir = PROJECT_ROOT / "briefings"
     out_dir.mkdir(exist_ok=True)
 
     dated = out_dir / f"portfolio_{date_str}.txt"
     latest = out_dir / "portfolio_latest.txt"
-    dated.write_text(formatted + "\n", encoding="utf-8")
-    latest.write_text(formatted + "\n", encoding="utf-8")
+    atomic_write_text(dated, formatted + "\n")
+    atomic_write_text(latest, formatted + "\n")
     return dated
 
 
@@ -841,15 +1026,25 @@ def copy_to_clipboard(text: str) -> bool:
         return False
 
 
-if __name__ == "__main__":
-    formatted, grand_total, total_positions, _results, as_of = fetch_portfolio_block()
+def main(argv=None) -> int:
+    parser = ArgumentParser(description="Fetch a read-only E*TRADE portfolio block.")
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Generate an unsafe, prominently marked result if an account fails.",
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    formatted, grand_total, total_positions, _results, as_of = fetch_portfolio_block(
+        allow_partial=args.allow_partial
+    )
     path = save_portfolio_block(formatted, as_of=as_of)
     clipped = copy_to_clipboard(formatted)
 
     print()
     print(formatted)
     print("\n" + "-" * 50)
-    print(f"Positions found: {total_positions} | Grand total: ${grand_total:,.0f}")
+    print(f"Positions found: {total_positions} | Grand total: USD {grand_total:,.0f}")
     print(f"Saved: {path}")
     if clipped:
         print("Clipboard: portfolio block copied — paste into grok.com (Ctrl+V)")
@@ -857,3 +1052,8 @@ if __name__ == "__main__":
         print("Clipboard: could not copy automatically — select the block above manually")
     print("-" * 50)
     print("\nNext: open grok.com → paste into your Daily Portfolio Action Briefing prompt.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

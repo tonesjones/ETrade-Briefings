@@ -10,8 +10,8 @@ budget → thesis/valuation → tax/lot → opportunity cost), not a stock check
 from __future__ import annotations
 
 import json
-import os
 import re
+from argparse import ArgumentParser
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -23,42 +23,41 @@ from get_portfolio import (
     format_taxable_cost_table,
     is_cash_symbol,
     save_portfolio_block,
+    atomic_write_text,
 )
+from portfolio_policy import POLICY
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUT_DIR = PROJECT_ROOT / "prompts"
 BRIEFINGS_DIR = PROJECT_ROOT / "briefings"
 
-# Direct chip / AI-infra names (hard do-not-increase stack when already ≥ 38%)
-AI_SEMI_CLUSTER = ("AMD", "MU", "NVDA", "TSM", "CRWV", "NBIS")
+# User-editable decision policy (portfolio_policy.json).
+AI_SEMI_CLUSTER = POLICY.sleeves["direct_ai_semi"]
+BROAD_AI_LIQUID = POLICY.sleeves["broad_ai_cycle"]
+CRYPTO_CLUSTER = POLICY.sleeves["crypto"]
+PAYMENTS_CLUSTER = POLICY.sleeves["payments"]
+BROAD_INDEX = POLICY.sleeves["broad_index"]
+ANALYZE_WEIGHT_FLOOR = POLICY.analyze_weight_floor_pct
+ANALYZE_MV_FLOOR = POLICY.analyze_market_value_floor
+MATERIAL_LOSS_DOLLARS = POLICY.material_loss_dollars
+MATERIAL_LOSS_PCT = POLICY.material_loss_pct
+HARVEST_LOSS_DOLLARS = POLICY.harvest_loss_dollars
+RISK_OFF_GLIDE = POLICY.risk_off_glide_pct
+SINGLE_NAME_CAP = POLICY.single_name_cap_pct
+CLUSTER_NO_ADD = POLICY.cluster_do_not_increase_pct
+CLUSTER_SOFT_CAP = POLICY.cluster_soft_cap_pct
+ALIASES = POLICY.aliases
 
-# Same cycle, not the same tickers — hyperscalers, power, plus the direct stack
-BROAD_AI_LIQUID = AI_SEMI_CLUSTER + ("GOOGL", "MSFT", "META", "AMZN", "CEG")
-CRYPTO_CLUSTER = ("BMNR", "ETHA")
-PAYMENTS_CLUSTER = ("MA",)
-BROAD_INDEX = ("VOO",)
 
-# Employer SNPS sleeve (not in E*TRADE liquid pull; include in full analysis)
-# Override with SNPS_MARKET_VALUE in .env if the mark changes
-DEFAULT_SNPS_MARKET_VALUE = 60_000.0
+def sleeve_member_text(symbols: tuple[str, ...]) -> str:
+    return " ".join(symbols)
 
-# Position table: ≥ 2.5% is the default. Below that, still force harvest
-# candidates and material losers (TE / BMNR class). Ignore stubs under $5k.
-ANALYZE_WEIGHT_FLOOR = 2.5
-ANALYZE_MV_FLOOR = 5_000.0
-MATERIAL_LOSS_DOLLARS = -5_000.0
-MATERIAL_LOSS_PCT = -20.0
-HARVEST_LOSS_DOLLARS = -250.0  # match collect_tax_flags
 
-# Friendly names for a few tickers in the prompt
-ALIASES = {
-    "CRWV": "CoreWeave",
-    "NBIS": "Nebius",
-    "GOOGL": "Alphabet Class A",
-    "GOOG": "Alphabet Class C",
-    "SNPS": "Synopsys (employer account)",
-}
-
+def broad_ai_sleeve_label() -> str:
+    extras = [s for s in BROAD_AI_LIQUID if s not in AI_SEMI_CLUSTER]
+    if extras:
+        return "direct + " + " ".join(extras)
+    return "direct"
 
 def consolidate(results, grand_total: float):
     by_sym: dict[str, dict] = defaultdict(
@@ -174,7 +173,7 @@ def fmt_weight(w: float) -> str:
 def holding_line(h: dict, as_of) -> str:
     alias = f" ({h['alias']})" if h.get("alias") else ""
     sym = h["symbol"]
-    if sym in ("SGOV", "BIL", "SGOVX") or "GOVERNMENT" in sym.upper():
+    if is_cash_symbol(sym):
         return (
             f"- Cash ({sym}) ≈ {fmt_money(h['market_value'])} "
             f"(~{fmt_weight(h['weight'])})"
@@ -203,9 +202,7 @@ def sleeve_stats(holdings: list[dict], symbols: tuple[str, ...], total: float):
 def must_analyze_holdings(holdings: list[dict]) -> list[dict]:
     """Names that must appear in the briefing position table.
 
-    Default is weight ≥ 2.5%. Also include taxable harvest candidates and
-    material economic losers even when they sit under that line — that is
-    what dropped TE and BMNR. Stubs under $5k (IBM) stay out.
+    Harvest and material-loss names stay in even when they sit under the weight floor.
     """
     out = []
     for h in holdings:
@@ -244,70 +241,24 @@ def format_must_analyze(rows: list[dict]) -> str:
     extra = [r for r in rows if "weight" not in r["analyze_reasons"]]
     lines = []
     if weight:
-        lines.append("- Weight ≥ 2.5%: " + ", ".join(weight))
+        lines.append(
+            f"- Weight ≥ {ANALYZE_WEIGHT_FLOOR:g}%: " + ", ".join(weight)
+        )
     if extra:
         bits = []
-        for r in extra:
+        for row in extra:
             tags = []
-            if "harvest" in r["analyze_reasons"]:
+            if "harvest" in row["analyze_reasons"]:
                 tags.append("taxable harvest")
-            tgp = r.get("total_gain_pct")
-            tg = r.get("total_gain")
-            if "loss" in r["analyze_reasons"]:
-                if tgp is not None:
-                    tags.append(f"{tgp:+.0f}%")
-                elif tg is not None:
-                    tags.append(fmt_money(tg))
-            label = r["symbol"]
-            if tags:
-                label += f" ({', '.join(tags)})"
-            bits.append(label)
-        lines.append(
-            "- Below 2.5% but harvest / material loss: " + ", ".join(bits)
-        )
-    lines.append("- Always: SNPS")
-    all_syms = [r["symbol"] for r in rows] + ["SNPS"]
-    lines.append("- **Do not skip:** " + ", ".join(all_syms))
+            tgp, tg = row.get("total_gain_pct"), row.get("total_gain")
+            if "loss" in row["analyze_reasons"]:
+                tags.append(f"{tgp:+.0f}%" if tgp is not None else fmt_money(tg))
+            bits.append(row["symbol"] + (f" ({', '.join(tags)})" if tags else ""))
+        lines.append("- Additional required analysis: " + ", ".join(bits))
+    symbols = [row["symbol"] for row in rows]
+    lines.append("- **Do not skip:** " + (", ".join(symbols) if symbols else "None"))
     return "\n".join(lines)
 
-
-def _env_money(name: str):
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return None
-    try:
-        return float(raw.replace(",", "").replace("$", ""))
-    except ValueError:
-        return None
-
-
-def snps_market_value() -> float:
-    return _env_money("SNPS_MARKET_VALUE") or DEFAULT_SNPS_MARKET_VALUE
-
-
-def snps_tradability_lines(economic_mv: float) -> str:
-    tradable = _env_money("SNPS_TRADABLE_VALUE")
-    restrictions = (os.getenv("SNPS_RESTRICTIONS") or "").strip()
-    lines = [
-        f"- Economic mark: {fmt_money(economic_mv)} "
-        "(not necessarily tradable)"
-    ]
-    if tradable is not None:
-        lines.append(f"- Currently tradable (if known): {fmt_money(tradable)}")
-    else:
-        lines.append(
-            "- Currently tradable: **unknown** — never assume the full "
-            f"{fmt_money(economic_mv)} is immediately saleable "
-            "(set SNPS_TRADABLE_VALUE in .env if you know it)"
-        )
-    if restrictions:
-        lines.append(f"- Employer restrictions: {restrictions}")
-    else:
-        lines.append(
-            "- Vested vs unvested / blackout / 10b5-1: **tradability unknown** "
-            "unless the user states otherwise"
-        )
-    return "\n".join(lines)
 
 
 def min_cut_to_cap(mv: float, total: float, cap_pct: float) -> float:
@@ -318,15 +269,14 @@ def min_cut_to_cap(mv: float, total: float, cap_pct: float) -> float:
 
 def snapshot_dict(holdings, metrics: dict, as_of: datetime) -> dict:
     return {
-        "as_of": as_of.strftime("%Y-%m-%d %H:%M"),
+        "schema_version": 1,
+        "as_of": as_of.isoformat(),
         "date": as_of.strftime("%Y-%m-%d"),
         "grand_total": metrics["grand_total"],
         "cluster_w": metrics["cluster_w"],
         "broad_w": metrics["broad_w"],
-        "broad_econ_w": metrics["broad_econ_w"],
         "cash_w": metrics["cash_w"],
         "top5_w": metrics["top5_w"],
-        "snps_mv": metrics["snps_mv"],
         "breaches": metrics.get("breaches") or [],
         "holdings": [
             {
@@ -346,8 +296,8 @@ def save_weights_snapshot(snap: dict, as_of: datetime) -> Path:
     dated = BRIEFINGS_DIR / f"weights_{as_of.strftime('%Y-%m-%d')}.json"
     latest = BRIEFINGS_DIR / "weights_latest.json"
     text = json.dumps(snap, indent=2)
-    dated.write_text(text, encoding="utf-8")
-    latest.write_text(text, encoding="utf-8")
+    atomic_write_text(dated, text)
+    atomic_write_text(latest, text)
     return dated
 
 
@@ -398,6 +348,8 @@ def parse_snapshot_from_prompt(text: str) -> dict | None:
     ])
     broad_w = _pct([r"Broad AI-cycle liquid[^\n]*?\*\*([\d.]+)%\*\*"])
     cash_w = _pct([
+        r"Cash \+ cash equivalents:[^\n]*?\(([\d.]+)%\)",
+        r"Cash \+ cash equivalents[^\n]*?\(([\d.]+)%\)",
         r"Cash \(SGOV\):[^\n]*?\(([\d.]+)%\)",
         r"Cash \(SGOV\)[^\n]*?~([\d.]+)%",
     ])
@@ -412,7 +364,7 @@ def parse_snapshot_from_prompt(text: str) -> dict | None:
         "holdings": holdings,
         "breaches": [
             h["symbol"] for h in holdings
-            if h["weight"] > 15 and h["symbol"] not in ("SGOV", "BIL")
+            if h["weight"] > SINGLE_NAME_CAP and not is_cash_symbol(h["symbol"])
         ],
     }
 
@@ -456,7 +408,7 @@ def format_daily_delta(today_snap: dict, prior: dict | None, prior_label: str) -
     today_h = {h["symbol"]: h for h in today_snap.get("holdings") or []}
     material = []
     for sym in sorted(set(prior_h) | set(today_h)):
-        if sym in ("SGOV", "BIL", "SGOVX"):
+        if is_cash_symbol(sym):
             continue
         pw = (prior_h.get(sym) or {}).get("weight")
         tw = (today_h.get(sym) or {}).get("weight")
@@ -498,15 +450,15 @@ def format_daily_delta(today_snap: dict, prior: dict | None, prior_label: str) -
     today_br = set(today_snap.get("breaches") or [])
     if today_br - prior_br:
         lines.append(
-            "- **New 15% breach:** " + ", ".join(sorted(today_br - prior_br))
+            f"- **New {SINGLE_NAME_CAP:g}% breach:** " + ", ".join(sorted(today_br - prior_br))
         )
     if prior_br - today_br:
         lines.append(
-            "- **15% breach cleared:** " + ", ".join(sorted(prior_br - today_br))
+            f"- **{SINGLE_NAME_CAP:g}% breach cleared:** " + ", ".join(sorted(prior_br - today_br))
         )
     if today_br and today_br == prior_br:
         lines.append(
-            "- 15% breach **unchanged:** " + ", ".join(sorted(today_br))
+            f"- {SINGLE_NAME_CAP:g}% breach **unchanged:** " + ", ".join(sorted(today_br))
         )
     lines.append(
         "Treat these as market-move vs thesis-move in Daily Delta. "
@@ -518,24 +470,24 @@ def format_daily_delta(today_snap: dict, prior: dict | None, prior_label: str) -
 def format_constraint_math(holdings, grand_total: float, cluster_mv: float) -> str:
     lines = []
     for h in holdings:
-        if h["symbol"] in ("SGOV", "BIL") or h["weight"] <= 15:
+        if is_cash_symbol(h["symbol"]) or h["weight"] <= SINGLE_NAME_CAP:
             continue
-        cut = min_cut_to_cap(h["market_value"], grand_total, 15.0)
+        cut = min_cut_to_cap(h["market_value"], grand_total, SINGLE_NAME_CAP)
         new_w = (
             (h["market_value"] - cut) / grand_total * 100 if grand_total else 0
         )
         lines.append(
             f"- **{h['symbol']}** at {fmt_weight(h['weight'])}: "
-            f"minimum sale to restore 15% ≈ **{fmt_money(cut)}** "
+            f"minimum sale to restore {SINGLE_NAME_CAP:g}% ≈ **{fmt_money(cut)}** "
             f"(→ {fmt_weight(new_w)}). A larger sale is optional — "
             "the limit does not require it."
         )
-    c40 = min_cut_to_cap(cluster_mv, grand_total, 40.0)
-    c38 = min_cut_to_cap(cluster_mv, grand_total, 38.0)
+    c40 = min_cut_to_cap(cluster_mv, grand_total, CLUSTER_SOFT_CAP)
+    c38 = min_cut_to_cap(cluster_mv, grand_total, CLUSTER_NO_ADD)
     if c40 > 0:
         lines.append(
-            f"- Direct AI/semi: min cut to 40% ≈ **{fmt_money(c40)}**; "
-            f"to 38% ≈ **{fmt_money(c38)}**. Do not force the full cut "
+            f"- Direct AI/semi: min cut to {CLUSTER_SOFT_CAP:g}% ≈ **{fmt_money(c40)}**; "
+            f"to {CLUSTER_NO_ADD:g}% ≈ **{fmt_money(c38)}**. Do not force the full cut "
             "if the only lots are punitive ST — remaining above the ceiling "
             "is allowed; adding is not."
         )
@@ -556,7 +508,7 @@ def format_marginal_10k(
         return "_Total unavailable._"
     unit = 10_000.0 / grand_total * 100
     top5_syms = {h["symbol"] for h in holdings[:5]}
-    cluster_ok = cluster_mv / grand_total * 100 < 38
+    cluster_ok = cluster_mv / grand_total * 100 < CLUSTER_NO_ADD
 
     def row(label, d_direct, d_broad, d_cash, d_top5, note):
         def fmt(x):
@@ -586,20 +538,37 @@ def format_marginal_10k(
         d_top5 = unit if (sym in top5_syms) else 0.0
         extra = note
         if d_direct and not cluster_ok:
-            extra += " — **do not add** while direct ≥ 38%"
+            extra += f" — **do not add** while direct ≥ {CLUSTER_NO_ADD:g}%"
         rows.append(row(label, d_direct, d_broad, -unit, d_top5, extra))
 
-    amd = next((h for h in holdings if h["symbol"] == "AMD"), None)
-    if amd:
-        cut15 = min_cut_to_cap(amd["market_value"], grand_total, 15.0)
-        rows.append("")
-        rows.append(
-            f"Sell $10k **AMD** → SGOV: Δ direct {-unit:.2f} pp, "
-            f"Δ broad {-unit:.2f}, Δ cash {unit:+.2f}, Δ top-5 {-unit:.2f}. "
-            f"AMD {fmt_weight(amd['weight'])} → "
-            f"{fmt_weight(amd['weight'] - unit)}. "
-            f"Min to restore 15% is only {fmt_money(cut15)}, not a 15% slice."
+    overweight = next(
+        (
+            h for h in holdings
+            if not is_cash_symbol(h["symbol"])
+            and h["weight"] > SINGLE_NAME_CAP
+        ),
+        None,
+    )
+    if overweight:
+        symbol = overweight["symbol"]
+        cut_to_cap = min_cut_to_cap(
+            overweight["market_value"], grand_total, SINGLE_NAME_CAP
         )
+        direct_delta = -unit if symbol in AI_SEMI_CLUSTER else 0.0
+        broad_delta = -unit if symbol in BROAD_AI_LIQUID else 0.0
+        top5_delta = -unit if symbol in top5_syms else 0.0
+        rows.extend([
+            "",
+            (
+                f"Sell $10k **{symbol}** → cash: Δ direct {direct_delta:+.2f} pp, "
+                f"Δ broad {broad_delta:+.2f}, Δ cash {unit:+.2f}, "
+                f"Δ top-5 {top5_delta:+.2f}. {symbol} "
+                f"{fmt_weight(overweight['weight'])} → "
+                f"{fmt_weight(overweight['weight'] - unit)}. "
+                f"Minimum to restore {SINGLE_NAME_CAP:g}% is "
+                f"{fmt_money(cut_to_cap)}."
+            ),
+        ])
     rows.append(
         f"$10k = **{unit:.2f} pp** of liquid ({fmt_money(grand_total)}). "
         "Use this unit on every proposed buy/sell."
@@ -616,82 +585,65 @@ def build_prompt(
     results=None,
 ) -> str:
     as_of_str = as_of.strftime("%Y-%m-%d %H:%M")
-    snps_mv = snps_market_value()
-    economic_total = grand_total + snps_mv
-    snps_w_econ = (snps_mv / economic_total * 100) if economic_total else 0
-    snps_w_liquid = (snps_mv / grand_total * 100) if grand_total else 0
-
+    direct_members = "+".join(AI_SEMI_CLUSTER)
+    broad_members = "+".join(BROAD_AI_LIQUID)
+    broad_sleeve_label = broad_ai_sleeve_label()
+    crypto_label = sleeve_member_text(CRYPTO_CLUSTER)
+    payments_label = sleeve_member_text(PAYMENTS_CLUSTER)
+    index_label = sleeve_member_text(BROAD_INDEX)
     cluster_mv, cluster_w, _ = sleeve_stats(holdings, AI_SEMI_CLUSTER, grand_total)
     broad_mv, broad_w, _ = sleeve_stats(holdings, BROAD_AI_LIQUID, grand_total)
-    broad_econ_mv = broad_mv + snps_mv
-    broad_econ_w = (broad_econ_mv / economic_total * 100) if economic_total else 0
     crypto_mv, crypto_w, _ = sleeve_stats(holdings, CRYPTO_CLUSTER, grand_total)
     pay_mv, pay_w, _ = sleeve_stats(holdings, PAYMENTS_CLUSTER, grand_total)
     voo_mv, voo_w, _ = sleeve_stats(holdings, BROAD_INDEX, grand_total)
 
-    cash_h = next((h for h in holdings if h["symbol"] in ("SGOV", "BIL", "SGOVX")), None)
-    cash_mv = cash_h["market_value"] if cash_h else 0.0
-    cash_w = cash_h["weight"] if cash_h else 0.0
+    cash_mv = sum(h["market_value"] for h in holdings if is_cash_symbol(h["symbol"]))
+    cash_w = (cash_mv / grand_total * 100) if grand_total else 0.0
 
     top5 = holdings[:5]
     top5_w = sum(h["weight"] for h in top5)
 
     breaches = [
-        h for h in holdings if h["weight"] > 15.0 and h["symbol"] not in ("SGOV", "BIL")
+        h for h in holdings if h["weight"] > SINGLE_NAME_CAP and not is_cash_symbol(h["symbol"])
     ]
 
     account_lines = "\n".join(
         f"  - {a['label']}: ≈ {fmt_money(a['total'])}" for a in accounts
     )
-    account_lines += (
-        f"\n  - Employer account (SNPS / Synopsys): ≈ {fmt_money(snps_mv)} "
-        f"(outside E*TRADE pull — include in full economic analysis)"
-    )
 
     holdings_lines = "\n".join(
         holding_line(h, as_of) for h in holdings if h["market_value"] >= 50
     )
-    holdings_lines += (
-        f"\n- SNPS (Synopsys, employer account) ≈ {fmt_money(snps_mv)} "
-        f"(~{fmt_weight(snps_w_econ)} of economic total; "
-        f"~{fmt_weight(snps_w_liquid)} vs liquid book alone)"
-    )
     analyze_rows = must_analyze_holdings(holdings)
     must_analyze_block = format_must_analyze(analyze_rows)
 
-    if cluster_w >= 40:
+    if cluster_w >= CLUSTER_SOFT_CAP:
         cluster_status = (
-            f"ABOVE 40% soft ceiling ({fmt_weight(cluster_w)}). "
-            "Do not increase. Allowed to *remain* above 40% only when the tax "
+            f"ABOVE {CLUSTER_SOFT_CAP:g}% soft ceiling ({fmt_weight(cluster_w)}). "
+            f"Do not increase. Remaining above {CLUSTER_SOFT_CAP:g}% is allowed only when the tax "
             "cost of cutting is punitive — never redefine the ceiling up."
         )
-    elif cluster_w >= 38:
+    elif cluster_w >= CLUSTER_NO_ADD:
         cluster_status = (
-            f"at the do-not-increase line ({fmt_weight(cluster_w)}). "
+            f"at the {CLUSTER_NO_ADD:g}% do-not-increase line ({fmt_weight(cluster_w)}). "
             "Do not add to this stack."
         )
     else:
         cluster_status = "within the soft ceiling."
 
     risk_live = (
-        f"- **Direct AI/semi** (AMD+MU+NVDA+TSM+CRWV+NBIS) ≈ "
+        f"- **Direct AI/semi** ({direct_members}) ≈ "
         f"**{fmt_weight(cluster_w)}** of liquid ({fmt_money(cluster_mv)}) — "
         f"{cluster_status}"
     )
     risk_live += (
-        f"\n- **Broad AI-cycle liquid** (direct + GOOGL+MSFT+META+AMZN+CEG) ≈ "
+        f"\n- **Broad AI-cycle liquid** ({broad_members}) ≈ "
         f"**{fmt_weight(broad_w)}** ({fmt_money(broad_mv)}). "
-        f"**Economic** (+SNPS) ≈ **{fmt_weight(broad_econ_w)}** "
-        f"({fmt_money(broad_econ_mv)}). Direct-stack % is a lower bound on cycle risk."
-    )
-    risk_live += (
-        f"\n- **SNPS employer sleeve** ≈ {fmt_money(snps_mv)} "
-        f"({fmt_weight(snps_w_econ)} of economic total) — in-scope; action "
-        "allowed when price/thesis warrants it (RSU/blackout/10b5-1 frictions)."
+        "Direct-stack % is a lower bound on cycle risk."
     )
     if breaches:
         risk_live += "\n" + "\n".join(
-            f"- **Soft single-name limit (15%) breached:** {h['symbol']} at {fmt_weight(h['weight'])}"
+            f"- **Soft single-name limit ({SINGLE_NAME_CAP:g}%) breached:** {h['symbol']} at {fmt_weight(h['weight'])}"
             for h in breaches
         )
 
@@ -710,10 +662,8 @@ def build_prompt(
             "grand_total": grand_total,
             "cluster_w": cluster_w,
             "broad_w": broad_w,
-            "broad_econ_w": broad_econ_w,
             "cash_w": cash_w,
             "top5_w": top5_w,
-            "snps_mv": snps_mv,
             "breaches": [h["symbol"] for h in breaches],
         },
         as_of,
@@ -725,7 +675,6 @@ def build_prompt(
     marginal_10k = format_marginal_10k(
         holdings, grand_total, cluster_mv, broad_mv, cash_mv, top5_w
     )
-    snps_trade = snps_tradability_lines(snps_mv)
 
     prompt = f"""You are the portfolio manager for this book — not a stock screener. Every recommendation must answer one of: **Keep it. Reduce it. Replace it. Deploy cash into something better.** Every sale must name **this ticker, this account, and this tax lot** — not a consolidated symbol.
 
@@ -750,22 +699,19 @@ Use the “As of” stamp below for marks. Do not invent prices, cost, dates, or
 
 # 1. Portfolio data (live — use these exact numbers)
 
-**As of:** {as_of_str} PDT  
-**Liquid E*TRADE ≈ {fmt_money(grand_total)}** · **Economic (liquid + SNPS) ≈ {fmt_money(economic_total)}**  
-**Top-5 (liquid):** {fmt_weight(top5_w)} · **Cash (SGOV):** {fmt_money(cash_mv)} ({fmt_weight(cash_w)})  
-**SNPS (employer):**
-{snps_trade}
+**As of:** {as_of_str} {as_of.tzname() or 'ET'}
+**E*TRADE total ≈ {fmt_money(grand_total)}**
+**Top-5 (E*TRADE):** {fmt_weight(top5_w)} · **Cash + cash equivalents:** {fmt_money(cash_mv)} ({fmt_weight(cash_w)})
 
 **Daily delta (market move vs thesis move):**
 {daily_delta}
 
 **Pre-computed factor sleeves (do not invent factor percentages):**
-- Direct AI/semi (AMD MU NVDA TSM CRWV NBIS): **{fmt_weight(cluster_w)}** / {fmt_money(cluster_mv)}
-- Broad AI-cycle liquid (direct + GOOGL MSFT META AMZN CEG): **{fmt_weight(broad_w)}** / {fmt_money(broad_mv)}
-- Broad AI-cycle economic (+ SNPS): **{fmt_weight(broad_econ_w)}** / {fmt_money(broad_econ_mv)}
-- Crypto (BMNR ETHA): {fmt_weight(crypto_w)} / {fmt_money(crypto_mv)}
-- Payments (MA): {fmt_weight(pay_w)} / {fmt_money(pay_mv)}
-- Broad index (VOO): {fmt_weight(voo_w)} / {fmt_money(voo_mv)}
+- Direct AI/semi ({direct_members}): **{fmt_weight(cluster_w)}** / {fmt_money(cluster_mv)}
+- Broad AI-cycle liquid ({broad_sleeve_label}): **{fmt_weight(broad_w)}** / {fmt_money(broad_mv)}
+- Crypto ({crypto_label}): {fmt_weight(crypto_w)} / {fmt_money(crypto_mv)}
+- Payments ({payments_label}): {fmt_weight(pay_w)} / {fmt_money(pay_mv)}
+- Broad index ({index_label}): {fmt_weight(voo_w)} / {fmt_money(voo_mv)}
 
 **Constraint math (minimum necessary — use these dollars):**
 {constraint_math}
@@ -783,7 +729,7 @@ Use the “As of” stamp below for marks. Do not invent prices, cost, dates, or
 **Must-analyze for the position table (pre-computed — do not skip):**
 {must_analyze_block}
 
-**Cost / lots (E*TRADE):** `avg` = cost/share (else price paid). `cost` = dollars in. `P/L` = unrealized vs that cost. Taxable **ST** = held ≤ 1 year; **LT** = held > 1 year. Mixed lots show both. IRA/Roth: economic P/L only — **not** capital-gains events. Same ticker in two accounts is two decision buckets. SNPS cost/date is not in this pull.
+**Cost / lots (E*TRADE):** `avg` = cost/share (else price paid). `cost` = dollars in. `P/L` = unrealized vs that cost. Taxable **ST** = held ≤ 1 year; **LT** = held > 1 year. Mixed lots show both. IRA/Roth: economic P/L only — **not** capital-gains events. Same ticker in two accounts is two decision buckets.
 
 **Taxable lot table (ST/LT source of truth for the brokerage):**
 
@@ -805,11 +751,10 @@ Use the “As of” stamp below for marks. Do not invent prices, cost, dates, or
 
 # 2. Risk limits (hard)
 
-- Liquid single-name soft max **15%**. Flag breaches. Use the **minimum necessary** dollar cut above — do not sell a 15% slice of AMD because it is 0.3 pp over.
-- Direct AI/semi: **do not increase** if already ≥ 38% (now {fmt_weight(cluster_w)}). Soft ceiling **40%**. You may *hold* above 40% when cutting would realize punitive ST tax. You may **not** raise the ceiling, and you may **not** add. In Risk-Off or when expected forward returns no longer pay for the risk, work *toward* 35% only via tax-aware lots.
+- Liquid single-name soft max **{SINGLE_NAME_CAP:g}%**. Flag breaches. Use the **minimum necessary** dollar cut above — do not sell a {SINGLE_NAME_CAP:g}% slice of a name merely because it is slightly over.
+- Direct AI/semi: **do not increase** if already ≥ {CLUSTER_NO_ADD:g}% (now {fmt_weight(cluster_w)}). Soft ceiling **{CLUSTER_SOFT_CAP:g}%**. You may *hold* above {CLUSTER_SOFT_CAP:g}% when cutting would realize punitive ST tax. You may **not** raise the ceiling, and you may **not** add. In Risk-Off or when expected forward returns no longer pay for the risk, work *toward* {RISK_OFF_GLIDE:g}% only via tax-aware lots.
 - Never apply ST/LT **capital-gains tax** to Traditional IRA or Roth.
 - **Wash-sale (hard):** before any taxable loss realization, check recent buys and the proposed replacement. Do not harvest and immediately repurchase the same or substantially identical security unless wash-sale implications are explicit. If unclear, say so and do not treat the loss as usable.
-- Do not invent liquid tickers. SNPS is in-scope. Distinguish **economic mark** vs **currently tradable** (see data). If tradability is unknown, say so — never assume the full sleeve can be sold today.
 
 ---
 
@@ -841,11 +786,11 @@ When a limit is breached: (1) use the pre-computed **minimum dollars** to restor
 
 ## Factor + $10k marginals
 
-Use the pre-computed sleeves and the $10k table. Every proposed **buy** must show Δ direct AI/semi, Δ broad AI-cycle, Δ cash, Δ top-5. GOOGL/MSFT/META/AMZN/SNPS/CEG are the same AI-capex tape — ticker diversity ≠ factor diversity. Do not invent a 9-factor model.
+Use the pre-computed sleeves and the $10k table. Every proposed **buy** must show Δ direct AI/semi, Δ broad AI-cycle, Δ cash, Δ top-5. The configured broad AI-cycle members ({broad_members}) share the same AI-capex tape — ticker diversity ≠ factor diversity. Do not invent a 9-factor model.
 
 ## Sizing
 
-Conviction uses only **remaining budget** after caps. High-vol names get a tighter cap. 15% is a ceiling, not a target.
+Conviction uses only **remaining budget** after caps. High-vol names get a tighter cap. {SINGLE_NAME_CAP:g}% is a ceiling, not a target.
 
 ## Opportunity cost (proposed trades only)
 
@@ -855,7 +800,7 @@ Buy: why this $10k vs the best 2 names already held (usually VOO / a core compou
 
 **Replace** requires all of: what is reduced and why; the replacement; risk removed; new exposure introduced; tax/friction; why the replacement has superior expected risk-adjusted return. “Sell and hold cash” is **Reduce / Deploy**, not Replace.
 
-## Thesis vs price (must-analyze names + always SNPS)
+## Thesis vs price (must-analyze names)
 
 Score separately: thesis · valuation · trend · catalyst. “Great company” ≠ “attractive at this price.” Every action you touch must include a **horizon** (days / weeks / months / event-driven).
 
@@ -907,27 +852,30 @@ State: **Why this ticker, this account, and this lot rather than the next-best a
 - Trades I will **not** make today, and why
 - Why, in 3–5 sentences
 
-**1. Daily Delta + Health (short)**  
-What changed vs the prior pull (use the pre-computed delta). Then 8–12 lines: weights, P/L territory, ST/LT, factor sleeves, cash, SNPS economic vs tradable, limit breaches. No 20-name 1d/1w/1m dump.
+**1. Daily Delta + Health (short)**
+What changed vs the prior pull (use the pre-computed delta). Then 8–12 lines: weights, P/L territory, ST/LT, factor sleeves, cash, limit breaches. No 20-name 1d/1w/1m dump.
 
-**2. Regime, catalysts, stress**  
+**2. Regime, catalysts, stress**
 Only what **changes a decision**. Then a **directional** stress (no fake VaR): Nasdaq −10%; semi index −15%; AI-capex expectations fall; rates spike; broad correction *without* AI-specific damage. Which names drive the drawdown, what offsets. Qualitative unless you have real numbers.
 
-**3. Must-analyze positions (list in §1 — weight ≥ 2.5%, harvest, material losses, SNPS)**  
-Every ticker in that list gets a row. Do not omit a name because it is under 2.5% — that is how TE / BMNR-class names disappear. Compact table: Action · horizon · last · avg/cost · P/L · term/account · thesis/valuation · target wt · one-line why. Tax-engine + two-sleeve compare **only** on Trim/Sell. Replace rows must pass the replacement test. Optional 1–3 new ideas if they pass factor + $10k.
+**3. Must-analyze positions (list in §1 — configured weight floor, harvest, material losses)**
+Every ticker in that list gets a row. Do not omit a name because it is under {ANALYZE_WEIGHT_FLOOR:g}% — harvest and material-loss names stay in even under the weight floor. Compact table: Action · horizon · last · avg/cost · P/L · term/account · thesis/valuation · target wt · one-line why. Tax-engine + two-sleeve compare **only** on Trim/Sell. Replace rows must pass the replacement test. Optional 1–3 new ideas if they pass factor + $10k.
 
-**4. Cash, tax bill, post-trade book**  
+**4. Cash, tax bill, post-trade book**
 SGOV plan (now {fmt_money(cash_mv)}). If any trade: min-necessary $ vs $ recommended; estimated ST/LT tax; updated cash, top-5, direct %, broad %, $10k marginals of the trade. Directional Nasdaq beta: up / similar / down. **No fake expected-return or drawdown to one decimal.**
 
-**5. Zones for the next session** (human checklist — not a live OMS)  
-Add / Hold / Trim / Exit on names you touched or near a limit. Include ≥1 SNPS level. Price = trigger, not thesis. One line: “If X happens, today’s decision is wrong.”
+**5. Zones for the next session** (human checklist — not a live OMS)
+Add / Hold / Trim / Exit on names you touched or near a limit. Price = trigger, not thesis. One line: “If X happens, today’s decision is wrong.”
 """
     return prompt.strip() + "\n"
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    parser = ArgumentParser(description="Build a portfolio decision prompt.")
+    parser.add_argument("--allow-partial", action="store_true", help="Generate an unsafe marked prompt when an account fails.")
+    args = parser.parse_args(argv)
     print("Fetching live E*TRADE portfolio...")
-    formatted, grand_total, npos, results, as_of = fetch_portfolio_block(verbose=True)
+    formatted, grand_total, npos, results, as_of = fetch_portfolio_block(verbose=True, allow_partial=args.allow_partial)
     save_portfolio_block(formatted, as_of=as_of)
 
     holdings, accounts = consolidate(results, grand_total)
@@ -939,8 +887,8 @@ def main() -> int:
     date_str = as_of.strftime("%Y-%m-%d")
     dated = OUT_DIR / f"daily_briefing_prompt_{date_str}.md"
     latest = OUT_DIR / "daily_briefing_prompt_latest.md"
-    dated.write_text(prompt, encoding="utf-8")
-    latest.write_text(prompt, encoding="utf-8")
+    atomic_write_text(dated, prompt)
+    atomic_write_text(latest, prompt)
 
     # Clipboard for quick paste into grok.com
     try:
