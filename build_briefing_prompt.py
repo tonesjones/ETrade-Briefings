@@ -962,7 +962,7 @@ def main() -> int:
     print(f"Total liquid:              ${grand_total:,.0f}")
     print(f"Positions:                 {npos}")
     if clipped:
-        print("Clipboard:                 FULL PROMPT copied — paste into grok.com")
+        print("Clipboard:                 FULL PROMPT copied — paste into your preferred model for analysis")
     print("=" * 60)
     return 0
 
