@@ -35,20 +35,20 @@ Then:
 2. **Ctrl+V** — the full prompt is already on the clipboard
 3. Send
 
-**Portfolio block only** (if you keep a fixed system prompt on grok.com):
+**Portfolio dump only** (local diagnostic, or if you keep a fixed system prompt on grok.com):
 
 ```powershell
 python get_portfolio.py
 ```
 
-That block is also tax-aware: per-account cost, unrealized P/L, date acquired, and **ST / LT** (mixed lots split). IRA/Roth show economic P/L with no capital-gains label.
+The daily Grok prompt does **not** reprint that dump. Lots appear once, in a single taxable + IRA + Roth table.
 
 ### Outputs each run
 
 | Command | Output |
 |---------|--------|
-| `build_briefing_prompt.py` | Full prompt → clipboard + `prompts/daily_briefing_prompt_YYYY-MM-DD.md` + `briefings/weights_YYYY-MM-DD.json` (for the next day’s delta) |
-| `get_portfolio.py` | Portfolio block (with cost / P/L / ST-LT) → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` |
+| `build_briefing_prompt.py` | Compact decision prompt → clipboard + `prompts/daily_briefing_prompt_YYYY-MM-DD.md` + `briefings/weights_YYYY-MM-DD.json` (for the next day’s delta) |
+| `get_portfolio.py` | Full per-account dump (cost / P/L / ST-LT) → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` — local diagnostic, not pasted into Grok |
 
 ### What the briefing asks Grok to decide
 
@@ -124,10 +124,38 @@ Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
 | `build_briefing_prompt.py` | **Daily command** — live portfolio + decision-engine prompt → clipboard |
 | `get_portfolio.py` | Portfolio block only, including cost / P/L / ST-LT |
 | etrade_auth.py | OAuth plus atomic .env token update — once per day after midnight ET |
+| `portfolio_policy.json` | Decision limits, sleeves, harvest floors, $10k examples |
+| `portfolio_policy.py` | Loads and validates that JSON |
 | `.env` | Secrets (gitignored) |
 | `.env.example` | Template for secrets |
 | `briefings/` | Dated portfolio blocks + `weights_YYYY-MM-DD.json` snapshots (gitignored) |
 | `prompts/` | Dated full briefing prompts (gitignored) |
+
+---
+
+## Editing the decision policy
+
+All briefing math and most instruction text read `portfolio_policy.json`. Edit that file — not the Python — when a cap, sleeve, or analysis floor changes. Then run:
+
+    python -m unittest discover -s tests -v
+
+| Key | What it does |
+|-----|----------------|
+| `single_name_cap_pct` | Soft max weight for one liquid name. Breaches get a minimum-dollar cut. |
+| `cluster_do_not_increase_pct` | Direct AI/semi: do not add at or above this weight. |
+| `cluster_soft_cap_pct` | Direct AI/semi soft ceiling. Holding above it is allowed only when cutting would realize punitive ST tax. |
+| `analyze_weight_floor_pct` | Names at or above this weight must appear in the position table. |
+| `analyze_market_value_floor` | Dollar floor before harvest / material-loss names are forced into the table. |
+| `material_loss_dollars` / `material_loss_pct` | Sized names past either loss threshold stay in the table even under the weight floor. |
+| `harvest_loss_dollars` | Taxable unrealized-loss flag (negative number). |
+| `risk_off_glide_pct` | Direct-stack weight to work *toward* in Risk-Off, via tax-aware lots. |
+| `st_gain_flag_dollars` / `lt_gain_flag_dollars` | Taxable ST / LT unrealized-gain flags in the live tax block. |
+| `cash_symbols` | Tickers treated as cash (plus any symbol containing `GOVERNMENT`). |
+| `sleeves` | Factor membership. Direct AI/semi is a subset of broad AI-cycle. Changing membership changes both the math and the prompt labels. |
+| `aliases` | Optional display names (`CRWV` → CoreWeave). |
+| `marginal_examples` | Rows in the pre-computed $10k table. `symbol` may be `null` for a generic diversifier. |
+
+`schema_version` must stay `1`. Missing required sleeves abort load.
 
 ---
 
@@ -178,3 +206,7 @@ OAuth tokens are saved automatically. Use --no-write-env together with --print-t
 - Never hard-code API keys
 - `briefings/` and `prompts/` are gitignored (position data is sensitive)
 - Commit `.env.example` only (placeholders), not real values
+- Keep the GitHub remote **private**. Never `git add -f` `.env`, `briefings/`, or `prompts/`
+- Local artifacts are the real book: dollars, cost, lots, and account last-4s. Do not zip `briefings/` or `prompts/` into email, a public gist, or a cloud chat
+- Grok sees the full prompt when you paste it — that is the workflow, not a leak in this repo
+- Optional lint: `pip install ruff` then `ruff check .`

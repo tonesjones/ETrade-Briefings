@@ -23,9 +23,12 @@ class PortfolioPolicy:
     material_loss_pct: float
     harvest_loss_dollars: float
     risk_off_glide_pct: float
+    st_gain_flag_dollars: float
+    lt_gain_flag_dollars: float
     cash_symbols: frozenset[str]
     sleeves: dict[str, tuple[str, ...]]
     aliases: dict[str, str]
+    marginal_examples: tuple[tuple[str, str | None, str], ...]
 
 
 def load_policy(path: Path = DEFAULT_POLICY_PATH) -> PortfolioPolicy:
@@ -39,6 +42,20 @@ def load_policy(path: Path = DEFAULT_POLICY_PATH) -> PortfolioPolicy:
     missing = required_sleeves - set(sleeves)
     if missing:
         raise ValueError(f"Missing policy sleeves: {', '.join(sorted(missing))}")
+    examples = []
+    for item in raw.get("marginal_examples") or ():
+        label = str(item["label"])
+        symbol = item.get("symbol")
+        symbol = str(symbol).upper() if symbol else None
+        examples.append((label, symbol, str(item.get("note") or "")))
+    if not examples:
+        examples = (
+            ("VOO", "VOO", "already top-5; diversifies factor"),
+            ("MSFT", "MSFT", "broad AI only — not direct semi"),
+            ("GOOGL", "GOOGL", "top-5 + broad AI-cycle"),
+            ("NVDA", "NVDA", "raises direct stack"),
+            ("New non-AI diversifier", None, "improves concentration / factor"),
+        )
     return PortfolioPolicy(
         schema_version=raw["schema_version"],
         single_name_cap_pct=float(raw["single_name_cap_pct"]),
@@ -50,9 +67,12 @@ def load_policy(path: Path = DEFAULT_POLICY_PATH) -> PortfolioPolicy:
         material_loss_pct=float(raw["material_loss_pct"]),
         harvest_loss_dollars=float(raw["harvest_loss_dollars"]),
         risk_off_glide_pct=float(raw["risk_off_glide_pct"]),
+        st_gain_flag_dollars=float(raw.get("st_gain_flag_dollars", 500.0)),
+        lt_gain_flag_dollars=float(raw.get("lt_gain_flag_dollars", 2000.0)),
         cash_symbols=frozenset(str(s).upper() for s in raw["cash_symbols"]),
         sleeves={k: tuple(str(s).upper() for s in v) for k, v in sleeves.items()},
         aliases={str(k).upper(): str(v) for k, v in (raw.get("aliases") or {}).items()},
+        marginal_examples=tuple(examples),
     )
 
 

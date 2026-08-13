@@ -17,10 +17,11 @@ from datetime import datetime
 from pathlib import Path
 
 from get_portfolio import (
+    account_tail,
     collect_tax_flags,
+    copy_to_clipboard,
     fetch_portfolio_block,
-    format_cost_suffix,
-    format_taxable_cost_table,
+    format_lot_table,
     is_cash_symbol,
     save_portfolio_block,
     atomic_write_text,
@@ -47,6 +48,7 @@ SINGLE_NAME_CAP = POLICY.single_name_cap_pct
 CLUSTER_NO_ADD = POLICY.cluster_do_not_increase_pct
 CLUSTER_SOFT_CAP = POLICY.cluster_soft_cap_pct
 ALIASES = POLICY.aliases
+MARGINAL_EXAMPLES = POLICY.marginal_examples
 
 
 def sleeve_member_text(symbols: tuple[str, ...]) -> str:
@@ -178,17 +180,27 @@ def holding_line(h: dict, as_of) -> str:
             f"- Cash ({sym}) ≈ {fmt_money(h['market_value'])} "
             f"(~{fmt_weight(h['weight'])})"
         )
-    buckets = h.get("tax_buckets") or {"taxable"}
-    if buckets == {"roth"}:
-        tax_bucket = "roth"
-    elif buckets == {"traditional"}:
-        tax_bucket = "traditional"
-    else:
-        tax_bucket = "taxable"
-    suffix = format_cost_suffix(h, as_of, tax_bucket=tax_bucket)
+    bits = []
+    tgp = h.get("total_gain_pct")
+    if tgp is not None:
+        bits.append(f"{tgp:+.0f}%")
+    loc = []
+    if h.get("taxable_mv"):
+        loc.append(f"taxable {fmt_money(h['taxable_mv'])}")
+    if h.get("ira_mv"):
+        loc.append(f"IRA {fmt_money(h['ira_mv'])}")
+    if h.get("roth_mv"):
+        loc.append(f"Roth {fmt_money(h['roth_mv'])}")
+    if len(loc) > 1:
+        bits.append(" + ".join(loc))
+    elif h.get("ira_mv") and not h.get("taxable_mv") and not h.get("roth_mv"):
+        bits.append("IRA")
+    elif h.get("roth_mv") and not h.get("taxable_mv") and not h.get("ira_mv"):
+        bits.append("Roth")
+    glance = f"  {'  '.join(bits)}" if bits else ""
     return (
         f"- {sym}{alias} {fmt_weight(h['weight'])}  "
-        f"({fmt_money(h['market_value'])} @ ${h['price']:.2f}{suffix})"
+        f"({fmt_money(h['market_value'])} @ ${h['price']:.2f}){glance}"
     )
 
 
@@ -255,8 +267,8 @@ def format_must_analyze(rows: list[dict]) -> str:
                 tags.append(f"{tgp:+.0f}%" if tgp is not None else fmt_money(tg))
             bits.append(row["symbol"] + (f" ({', '.join(tags)})" if tags else ""))
         lines.append("- Additional required analysis: " + ", ".join(bits))
-    symbols = [row["symbol"] for row in rows]
-    lines.append("- **Do not skip:** " + (", ".join(symbols) if symbols else "None"))
+    if not lines:
+        return "- None"
     return "\n".join(lines)
 
 
@@ -477,19 +489,17 @@ def format_constraint_math(holdings, grand_total: float, cluster_mv: float) -> s
             (h["market_value"] - cut) / grand_total * 100 if grand_total else 0
         )
         lines.append(
-            f"- **{h['symbol']}** at {fmt_weight(h['weight'])}: "
-            f"minimum sale to restore {SINGLE_NAME_CAP:g}% ≈ **{fmt_money(cut)}** "
-            f"(→ {fmt_weight(new_w)}). A larger sale is optional — "
-            "the limit does not require it."
+            f"- **{h['symbol']}** {fmt_weight(h['weight'])}: "
+            f"min **{fmt_money(cut)}** to restore {SINGLE_NAME_CAP:g}% "
+            f"(→ {fmt_weight(new_w)}). Larger is optional."
         )
     c40 = min_cut_to_cap(cluster_mv, grand_total, CLUSTER_SOFT_CAP)
     c38 = min_cut_to_cap(cluster_mv, grand_total, CLUSTER_NO_ADD)
     if c40 > 0:
         lines.append(
-            f"- Direct AI/semi: min cut to {CLUSTER_SOFT_CAP:g}% ≈ **{fmt_money(c40)}**; "
-            f"to {CLUSTER_NO_ADD:g}% ≈ **{fmt_money(c38)}**. Do not force the full cut "
-            "if the only lots are punitive ST — remaining above the ceiling "
-            "is allowed; adding is not."
+            f"- Direct AI/semi: **{fmt_money(c40)}** to {CLUSTER_SOFT_CAP:g}%; "
+            f"**{fmt_money(c38)}** to {CLUSTER_NO_ADD:g}%. Hold-above OK if only "
+            "lots are punitive ST; do not add."
         )
     if not lines:
         return "- No single-name or cluster cap currently requires a sale."
@@ -525,13 +535,7 @@ def format_marginal_10k(
         "| Deploy $10k from SGOV into | Δ direct | Δ broad | Δ cash | Δ top-5 | Note |",
         "|---|---:|---:|---:|---:|---|",
     ]
-    specs = [
-        ("VOO", "VOO", "already top-5; diversifies factor"),
-        ("MSFT", "MSFT", "broad AI only — not direct semi"),
-        ("GOOGL", "GOOGL", "top-5 + broad AI-cycle"),
-        ("NVDA", "NVDA", "raises direct stack"),
-        ("New non-AI diversifier", None, "improves concentration / factor"),
-    ]
+    specs = list(MARGINAL_EXAMPLES)
     for label, sym, note in specs:
         d_direct = unit if sym in AI_SEMI_CLUSTER else 0.0
         d_broad = unit if sym in BROAD_AI_LIQUID else 0.0
@@ -607,9 +611,24 @@ def build_prompt(
         h for h in holdings if h["weight"] > SINGLE_NAME_CAP and not is_cash_symbol(h["symbol"])
     ]
 
-    account_lines = "\n".join(
-        f"  - {a['label']}: ≈ {fmt_money(a['total'])}" for a in accounts
-    )
+    account_bits = []
+    for a in accounts:
+        if (a.get("total") or 0) < 1:
+            continue
+        label = a.get("label") or ""
+        name = label.split(" / ")[0].split(" (")[0]
+        tail = account_tail(label)
+        loc = a.get("tax_bucket") or "taxable"
+        loc_note = ""
+        if loc == "taxable" and "IRA" not in name.upper() and "ROTH" not in name.upper():
+            loc_note = " (taxable)"
+        elif loc == "traditional" and "IRA" not in name.upper():
+            loc_note = " (IRA)"
+        elif loc == "roth" and "ROTH" not in name.upper():
+            loc_note = " (Roth)"
+        shown = f"{name} {tail}" if tail and tail not in name else name
+        account_bits.append(f"  - {shown}{loc_note}: ≈ {fmt_money(a['total'])}")
+    account_lines = "\n".join(account_bits) if account_bits else "  - _No funded accounts._"
 
     holdings_lines = "\n".join(
         holding_line(h, as_of) for h in holdings if h["market_value"] >= 50
@@ -619,42 +638,22 @@ def build_prompt(
 
     if cluster_w >= CLUSTER_SOFT_CAP:
         cluster_status = (
-            f"ABOVE {CLUSTER_SOFT_CAP:g}% soft ceiling ({fmt_weight(cluster_w)}). "
-            f"Do not increase. Remaining above {CLUSTER_SOFT_CAP:g}% is allowed only when the tax "
-            "cost of cutting is punitive — never redefine the ceiling up."
+            f"ABOVE {CLUSTER_SOFT_CAP:g}% ceiling — do not add; hold-above only "
+            "if cutting is punitive ST"
         )
     elif cluster_w >= CLUSTER_NO_ADD:
-        cluster_status = (
-            f"at the {CLUSTER_NO_ADD:g}% do-not-increase line ({fmt_weight(cluster_w)}). "
-            "Do not add to this stack."
-        )
+        cluster_status = f"at {CLUSTER_NO_ADD:g}% do-not-increase — do not add"
     else:
-        cluster_status = "within the soft ceiling."
-
-    risk_live = (
-        f"- **Direct AI/semi** ({direct_members}) ≈ "
-        f"**{fmt_weight(cluster_w)}** of liquid ({fmt_money(cluster_mv)}) — "
-        f"{cluster_status}"
-    )
-    risk_live += (
-        f"\n- **Broad AI-cycle liquid** ({broad_members}) ≈ "
-        f"**{fmt_weight(broad_w)}** ({fmt_money(broad_mv)}). "
-        "Direct-stack % is a lower bound on cycle risk."
-    )
-    if breaches:
-        risk_live += "\n" + "\n".join(
-            f"- **Soft single-name limit ({SINGLE_NAME_CAP:g}%) breached:** {h['symbol']} at {fmt_weight(h['weight'])}"
-            for h in breaches
-        )
+        cluster_status = "within ceiling"
 
     tax_table = (
-        format_taxable_cost_table(results, as_of)
+        format_lot_table(results, as_of)
         if results is not None
-        else "_Cost table unavailable this run._"
+        else "_Lot table unavailable this run._"
     )
-    tax_flags = "\n".join(
-        collect_tax_flags(results, as_of) if results is not None else []
-    )
+    tax_flag_lines = collect_tax_flags(results, as_of) if results is not None else []
+    tax_flags = "\n".join(tax_flag_lines)
+    tax_flag_block = f"\n**Tax flags:**\n{tax_flags}\n" if tax_flags else ""
 
     today_snap = snapshot_dict(
         holdings,
@@ -676,196 +675,89 @@ def build_prompt(
         holdings, grand_total, cluster_mv, broad_mv, cash_mv, top5_w
     )
 
-    prompt = f"""You are the portfolio manager for this book — not a stock screener. Every recommendation must answer one of: **Keep it. Reduce it. Replace it. Deploy cash into something better.** Every sale must name **this ticker, this account, and this tax lot** — not a consolidated symbol.
+    prompt = f"""You are the PM for this book, not a screener. Actions: **Keep / Reduce / Replace / Deploy**. A sale names **this ticker, this account, this lot**. Use the As-of marks. Do not invent prices, cost, dates, or ST/LT.
 
-Core reasoning (always):
-1. What risk am I trying to control?
-2. Is it the company, valuation, factor, or position size?
-3. Does the position need to be reduced?
-4. What is the **smallest economically meaningful** reduction?
-5. Which account and lot accomplish that most efficiently?
-6. What should the proceeds fund?
-7. Does a replacement improve portfolio-level diversification?
-8. What does the post-trade book look like (weights + $10k marginals)?
-9. What specific event makes today’s decision wrong?
-
-Title the briefing from system date:
-
-**Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
-
-Use the “As of” stamp below for marks. Do not invent prices, cost, dates, or ST/LT. If a field is missing, say so.
+Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
 
 ---
 
-# 1. Portfolio data (live — use these exact numbers)
+# 1. Live book
 
 **As of:** {as_of_str} {as_of.tzname() or 'ET'}
 **E*TRADE total ≈ {fmt_money(grand_total)}**
 **Top-5 (E*TRADE):** {fmt_weight(top5_w)} · **Cash + cash equivalents:** {fmt_money(cash_mv)} ({fmt_weight(cash_w)})
 
-**Daily delta (market move vs thesis move):**
+**Daily delta:**
 {daily_delta}
 
-**Pre-computed factor sleeves (do not invent factor percentages):**
-- Direct AI/semi ({direct_members}): **{fmt_weight(cluster_w)}** / {fmt_money(cluster_mv)}
-- Broad AI-cycle liquid ({broad_sleeve_label}): **{fmt_weight(broad_w)}** / {fmt_money(broad_mv)}
+**Factor sleeves (do not invent %):**
+- Direct AI/semi ({direct_members}): **{fmt_weight(cluster_w)}** / {fmt_money(cluster_mv)} — {cluster_status}
+- Broad AI-cycle liquid ({broad_sleeve_label}): **{fmt_weight(broad_w)}** / {fmt_money(broad_mv)} (direct is a lower bound on cycle risk)
 - Crypto ({crypto_label}): {fmt_weight(crypto_w)} / {fmt_money(crypto_mv)}
 - Payments ({payments_label}): {fmt_weight(pay_w)} / {fmt_money(pay_mv)}
 - Broad index ({index_label}): {fmt_weight(voo_w)} / {fmt_money(voo_mv)}
 
-**Constraint math (minimum necessary — use these dollars):**
+**Constraint math (use these dollars):**
 {constraint_math}
 
-**Marginal $10,000 from SGOV (pre-computed; apply the same unit to every proposed trade):**
+**Marginal $10k from SGOV (apply this unit to every proposed trade):**
 {marginal_10k}
 
-**Accounts (tax location is not optional):**
+**Accounts:**
 {account_lines}
 
 **Consolidated holdings:**
 
 {holdings_lines}
 
-**Must-analyze for the position table (pre-computed — do not skip):**
+**Must-analyze (do not skip):**
 {must_analyze_block}
 
-**Cost / lots (E*TRADE):** `avg` = cost/share (else price paid). `cost` = dollars in. `P/L` = unrealized vs that cost. Taxable **ST** = held ≤ 1 year; **LT** = held > 1 year. Mixed lots show both. IRA/Roth: economic P/L only — **not** capital-gains events. Same ticker in two accounts is two decision buckets.
-
-**Taxable lot table (ST/LT source of truth for the brokerage):**
+**Lots** (source of truth). Avg = cost/share. Cost = dollars in. P/L = unrealized. Taxable ST = held ≤ 1 year; LT = held > 1 year. IRA/Roth = economic P/L only — not a CG event. Same ticker in two accounts = two decision buckets.
 
 {tax_table}
-
-**Live cost / tax flags:**
-{tax_flags}
-
-**Per-account source block:**
-
-```
-{portfolio_block}
-```
-
-**Live risk flags:**
-{risk_live}
-
+{tax_flag_block}
 ---
 
-# 2. Risk limits (hard)
+# 2. Rules
 
-- Liquid single-name soft max **{SINGLE_NAME_CAP:g}%**. Flag breaches. Use the **minimum necessary** dollar cut above — do not sell a {SINGLE_NAME_CAP:g}% slice of a name merely because it is slightly over.
-- Direct AI/semi: **do not increase** if already ≥ {CLUSTER_NO_ADD:g}% (now {fmt_weight(cluster_w)}). Soft ceiling **{CLUSTER_SOFT_CAP:g}%**. You may *hold* above {CLUSTER_SOFT_CAP:g}% when cutting would realize punitive ST tax. You may **not** raise the ceiling, and you may **not** add. In Risk-Off or when expected forward returns no longer pay for the risk, work *toward* {RISK_OFF_GLIDE:g}% only via tax-aware lots.
-- Never apply ST/LT **capital-gains tax** to Traditional IRA or Roth.
-- **Wash-sale (hard):** before any taxable loss realization, check recent buys and the proposed replacement. Do not harvest and immediately repurchase the same or substantially identical security unless wash-sale implications are explicit. If unclear, say so and do not treat the loss as usable.
+**Limits.** Single-name soft max **{SINGLE_NAME_CAP:g}%**. Use the pre-computed min $ — do not sell a {SINGLE_NAME_CAP:g}% slice of a name because it is slightly over. Direct AI/semi: do not add at ≥ {CLUSTER_NO_ADD:g}% (now {fmt_weight(cluster_w)}). Soft ceiling **{CLUSTER_SOFT_CAP:g}%**; holding above is allowed only if cutting is punitive ST — never raise the ceiling. Risk-Off: work *toward* {RISK_OFF_GLIDE:g}% via tax-aware lots only.
 
----
+**Tax.** No ST/LT capital-gains tax on Traditional IRA / Roth. Wash-sale: do not harvest and immediately buy the same or substantially identical name unless implications are explicit; if unclear, do not treat the loss as usable.
 
-# 3. Decision engine
+**Hierarchy.** (1) concentration / drawdown (2) do not tidy a working thesis — #2 cannot veto a hard #1 (3) risk-adjusted return (4) tax/friction (5) deploy cash only if return beats liquidity. #1 beats #3 and #4. #4 beats incremental #3.
 
-## Objective hierarchy
+**Trade bar.** Prefer **no trade** when benefit does not clearly exceed tax/friction. Forced: hard limit; thesis break; unacceptable downside or factor drawdown; or valuation so poor that expected return no longer pays for the risk and tax. Hold is a valid high-conviction call. Do not manufacture trades.
 
-1. Avoid unacceptable portfolio-level concentration / drawdown.
-2. Do not sell a working thesis just to tidy weights. **#2 cannot veto a hard #1 breach.**
-3. Maximize expected risk-adjusted return.
-4. Minimize unnecessary taxes and trading friction.
-5. Deploy cash only when expected return justifies less liquidity.
+**Sizing.** On a breach: use the pre-computed min $, compare a larger cut, pick the smallest that actually fixes the problem. Do not sell more because it is profitable. {SINGLE_NAME_CAP:g}% is a ceiling, not a target. High-vol names get a tighter cap. Conviction uses remaining budget after caps.
 
-Never sacrifice **#1** for #3. Never sacrifice **#4** for *incremental* #3. **#1 beats #4.**
+**Factor.** Every buy shows Δ direct / Δ broad / Δ cash / Δ top-5 from the $10k table. Broad members ({broad_members}) share the AI-capex tape — ticker diversity ≠ factor diversity. Buy: why this $10k vs the best 2 names already held. Sale: why this reducer rather than another.
 
-## Trade threshold
+**Replace** = named sale + named buy (cash is Reduce/Deploy). State risk removed, risk added, tax, and why expected R/R is better.
 
-Do not recommend a taxable sale because another asset looks marginally better. Compare: book benefit · tax/friction · concentration actually removed · use of proceeds · whether the cut can wait.
+**Thesis vs price.** Score thesis · valuation · trend · catalyst separately. Horizon on every action. Price is a trigger, not a thesis — classify moves as market / factor / company / noise. Harvest only taxable losses, and only if thesis is weak, wash-sale is clear, and tax benefit is worth it.
 
-**Prefer no trade** when the benefit does not clearly exceed the tax cost.
+**New ideas.** Only with cash/proceeds, must not raise direct AI/semi, must pass the $10k test.
 
-A forced trade is justified when: a hard risk limit is breached; the thesis materially breaks; downside asymmetry is unacceptable; factor concentration creates unacceptable drawdown risk; **or valuation is sufficiently unfavorable that expected forward return no longer compensates for the risk and tax/friction** (not only when someone would call it “extreme”).
+# 3. Tax engine (Trim/Sell only)
 
-**Hold / no action is a valid, often high-conviction, PM decision.** Do not manufacture trades.
+A ticker is not one lot (taxable LT ≠ taxable ST ≠ IRA). Compare at least two sleeves. Pick account/lot on: risk removed · tax · thesis of what you sell · leftover factor · ST→LT optionality. Tax-free ≠ correct sleeve — do not gut IRA/Roth to spare a taxable ST lot you were not forced to touch. If the only cheap cut is IRA, say so. If the only taxable cut is a fat ST gain, prefer no trade unless #1 forces it. State: **why this ticker, account, and lot vs the next-best.** Then recompute weights, sleeves, cash, tax, $10k.
 
-## Minimum necessary trade
+# 4. Output (this order, short)
 
-When a limit is breached: (1) use the pre-computed **minimum dollars** to restore it or materially improve risk; (2) compare that with a larger cut; (3) prefer the **smallest trade that meaningfully fixes the problem** unless thesis/valuation independently justifies more. Do not sell more because the position is profitable.
+**Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
 
-## Factor + $10k marginals
+**0. Executive Decision** — Trade / No trade · High/Medium/Low · Reduce/Maintain/Add + Risk-On/Neutral/Off · trades (ticker, account, lot/term, $, horizon, proceeds) or None · trades I will not make · why in 3–5 sentences
 
-Use the pre-computed sleeves and the $10k table. Every proposed **buy** must show Δ direct AI/semi, Δ broad AI-cycle, Δ cash, Δ top-5. The configured broad AI-cycle members ({broad_members}) share the same AI-capex tape — ticker diversity ≠ factor diversity. Do not invent a 9-factor model.
+**1. Daily Delta + Health** — use the pre-computed delta; 8–12 lines on weights, P/L, ST/LT, sleeves, cash, breaches. No 20-name tape dump.
 
-## Sizing
+**2. Regime / stress** — only what changes a decision. Directional (no fake VaR): Nasdaq −10%; semi −15%; AI-capex down; rates spike; broad correction without AI damage.
 
-Conviction uses only **remaining budget** after caps. High-vol names get a tighter cap. {SINGLE_NAME_CAP:g}% is a ceiling, not a target.
+**3. Must-analyze** — every name listed in §1. Do not omit a name because it is under {ANALYZE_WEIGHT_FLOOR:g}%; harvest and material-loss names stay in. Compact table: Action · horizon · last · avg/cost · P/L · term/account · thesis/valuation · target wt · one-line why. Tax-engine + two-sleeve compare only on Trim/Sell. Optional 1–3 new ideas if they pass factor + $10k.
 
-## Opportunity cost (proposed trades only)
+**4. Cash / tax / post-trade** — SGOV plan (now {fmt_money(cash_mv)}). If any trade: min $ vs recommended; estimated ST/LT tax; updated cash, top-5, direct %, broad %, $10k of the trade. Nasdaq beta: up / similar / down. No fake expected-return or drawdown to one decimal.
 
-Buy: why this $10k vs the best 2 names already held (usually VOO / a core compounder / SGOV), with the marginal %s. Sale: why this reducer of the risk rather than another.
-
-## Replacement test
-
-**Replace** requires all of: what is reduced and why; the replacement; risk removed; new exposure introduced; tax/friction; why the replacement has superior expected risk-adjusted return. “Sell and hold cash” is **Reduce / Deploy**, not Replace.
-
-## Thesis vs price (must-analyze names)
-
-Score separately: thesis · valuation · trend · catalyst. “Great company” ≠ “attractive at this price.” Every action you touch must include a **horizon** (days / weeks / months / event-driven).
-
-## Harvest (taxable losses only)
-
-Thesis intact? Buy it today? Better replacement? Wash-sale? Tax benefit worth the economic sale? Do not harvest just because a name is red.
-
-## Price is a trigger, not a thesis
-
-When a zone is hit, classify the move: market-wide / factor-wide / company-specific / noise. Escalate to Sell/Exit only if supported by a material change in thesis, valuation, structure, or portfolio risk. Do not whipsaw volatile names on price alone.
-
-## New ideas
-
-Only if cash/proceeds exist and they do **not** raise direct AI/semi. Must pass the $10k marginal test.
-
----
-
-# 4. Tax engine (Trim/Sell only — skip on Holds)
-
-A ticker is **not** one fungible lot. AMD taxable LT ≠ AMD taxable ST ≠ IRA AMD.
-
-1. Should **economic** exposure fall? If yes, by the **minimum necessary** dollars.
-2. Choose **account and lot** — not a fixed waterfall.
-3. Estimate tax (ST ≈ ordinary; LT ≈ LTCG; $0 CG on IRA/Roth — that does **not** make them the default sleeve).
-4. Where do proceeds go? If claimed as Replace, pass the replacement test.
-5. Recalculate weights, factor sleeves, cash, tax realized, and the $10k marginals.
-
-## Account / lot selection
-
-Pick the account and lot with the best combination of: risk reduction achieved · tax/friction · thesis quality of what you sell · remaining factor concentration · future tax optionality (e.g. letting ST lots age into LT).
-
-When two feasible sleeves exist, **compare at least two** (e.g. taxable LT vs IRA vs taxable ST). Do **not** use a fixed account liquidation order. Explain why the chosen account/lot dominates the alternative.
-
-“Tax-free to sell” ≠ “correct sleeve.” Do not gut IRA/Roth compounders to spare a taxable ST lot you were not forced to touch. If the only cheap economic cut is IRA, say so. If the only taxable cut is a fat ST gain, **prefer no trade** unless #1 forces it.
-
-State: **Why this ticker, this account, and this lot rather than the next-best alternative?**
-
----
-
-# 5. Output format (this order — scannable, short)
-
-**Daily Portfolio Action Briefing – [Date] – Live E*TRADE Book**
-
-**0. Executive Decision**
-- Best action today: **Trade** / **No trade**
-- Confidence: High / Medium / Low   (e.g. “No trade — High confidence” is a complete answer)
-- Posture: Reduce risk / Maintain / Add risk  +  Risk-On / Neutral / Risk-Off
-- Trades today (ticker, **account**, **lot/term**, **$ size**, **horizon**, proceeds) — or **None**
-- Trades I will **not** make today, and why
-- Why, in 3–5 sentences
-
-**1. Daily Delta + Health (short)**
-What changed vs the prior pull (use the pre-computed delta). Then 8–12 lines: weights, P/L territory, ST/LT, factor sleeves, cash, limit breaches. No 20-name 1d/1w/1m dump.
-
-**2. Regime, catalysts, stress**
-Only what **changes a decision**. Then a **directional** stress (no fake VaR): Nasdaq −10%; semi index −15%; AI-capex expectations fall; rates spike; broad correction *without* AI-specific damage. Which names drive the drawdown, what offsets. Qualitative unless you have real numbers.
-
-**3. Must-analyze positions (list in §1 — configured weight floor, harvest, material losses)**
-Every ticker in that list gets a row. Do not omit a name because it is under {ANALYZE_WEIGHT_FLOOR:g}% — harvest and material-loss names stay in even under the weight floor. Compact table: Action · horizon · last · avg/cost · P/L · term/account · thesis/valuation · target wt · one-line why. Tax-engine + two-sleeve compare **only** on Trim/Sell. Replace rows must pass the replacement test. Optional 1–3 new ideas if they pass factor + $10k.
-
-**4. Cash, tax bill, post-trade book**
-SGOV plan (now {fmt_money(cash_mv)}). If any trade: min-necessary $ vs $ recommended; estimated ST/LT tax; updated cash, top-5, direct %, broad %, $10k marginals of the trade. Directional Nasdaq beta: up / similar / down. **No fake expected-return or drawdown to one decimal.**
-
-**5. Zones for the next session** (human checklist — not a live OMS)
-Add / Hold / Trim / Exit on names you touched or near a limit. Price = trigger, not thesis. One line: “If X happens, today’s decision is wrong.”
+**5. Zones** — Add / Hold / Trim / Exit on names you touched or near a limit. One line: if X happens, today’s decision is wrong.
 """
     return prompt.strip() + "\n"
 
@@ -890,18 +782,7 @@ def main(argv=None) -> int:
     atomic_write_text(dated, prompt)
     atomic_write_text(latest, prompt)
 
-    # Clipboard for quick paste into grok.com
-    try:
-        import subprocess
-
-        subprocess.run(
-            ["clip"],
-            input=prompt.encode("utf-16-le"),
-            check=True,
-        )
-        clipped = True
-    except Exception:
-        clipped = False
+    clipped = copy_to_clipboard(prompt)
 
     print()
     print("=" * 60)

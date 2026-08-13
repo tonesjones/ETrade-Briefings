@@ -9,6 +9,8 @@
   "material_loss_pct": -20.0,
   "harvest_loss_dollars": -250.0,
   "risk_off_glide_pct": 35.0,
+  "st_gain_flag_dollars": 500.0,
+  "lt_gain_flag_dollars": 2000.0,
   "cash_symbols": ["CASH", "SGOV", "BIL", "SGOVX"],
   "sleeves": {
     "direct_ai_semi": ["AMD", "MU", "NVDA", "TSM", "CRWV", "NBIS"],
@@ -22,5 +24,12 @@
     "NBIS": "Nebius",
     "GOOGL": "Alphabet Class A",
     "GOOG": "Alphabet Class C"
-  }
+  },
+  "marginal_examples": [
+    {"label": "VOO", "symbol": "VOO", "note": "already top-5; diversifies factor"},
+    {"label": "MSFT", "symbol": "MSFT", "note": "broad AI only — not direct semi"},
+    {"label": "GOOGL", "symbol": "GOOGL", "note": "top-5 + broad AI-cycle"},
+    {"label": "NVDA", "symbol": "NVDA", "note": "raises direct stack"},
+    {"label": "New non-AI diversifier", "symbol": null, "note": "improves concentration / factor"}
+  ]
 }

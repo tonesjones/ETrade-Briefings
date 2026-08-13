@@ -20,7 +20,6 @@ No preview, place, cancel, or change-order calls exist in this repo.
 from __future__ import annotations
 
 import os
-import json
 import logging
 import subprocess
 import time
@@ -36,9 +35,8 @@ from portfolio_policy import POLICY
 # Do not import or construct pyetrade.ETradeOrder — trading is intentionally unsupported.
 _ALLOWED_PYETRADE_TYPES = (pyetrade.ETradeAccounts,)
 
-load_dotenv()
-
 PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 try:
     ET = ZoneInfo("America/New_York")
@@ -157,15 +155,46 @@ def holding_period(acquired: datetime | None, as_of: datetime) -> str:
     return "ST"
 
 
+_ROTH_ACCOUNT_TYPES = frozenset({
+    "ROTHIRA", "ROTH", "ROTH401K", "ROTH403B",
+})
+_TRADITIONAL_ACCOUNT_TYPES = frozenset({
+    "CONTRIBUTORY", "IRA", "TRADITIONAL", "TRADITIONALIRA",
+    "401K", "403B", "SEP", "SEPIRA", "SIMPLE", "SIMPLEIRA",
+    "PENSION", "COVERDELL", "MONEYPURCHASE", "PROFITSHARING",
+    "INDIVIDUALK", "ROLLOVER", "ROLLOVERIRA",
+})
+_TAXABLE_ACCOUNT_TYPES = frozenset({
+    "INDIVIDUAL", "BROKERAGE", "MARGIN", "JOINT", "CUSTODIAL", "TRUST",
+})
+_RETIREMENT_NAME_MARKERS = (
+    "IRA", "CONTRIBUTORY", "TRADITIONAL", "401K", "401(K)", "403B", "403(B)",
+    "SEP", "SIMPLE", "PENSION", "RETIREMENT", "COVERDELL",
+    "MONEY_PURCHASE", "PROFIT_SHARING", "INDIVIDUAL_K",
+)
+
+
+def _normalize_account_type(raw) -> str:
+    return str(raw or "").upper().replace(" ", "").replace("_", "").replace("-", "")
+
+
 def tax_bucket_from_account(acct: dict) -> str:
+    """Classify from official accountType first; name matching is fallback only."""
+    acct_type = _normalize_account_type(acct.get("accountType"))
+    if acct_type in _ROTH_ACCOUNT_TYPES or acct_type.startswith("ROTH"):
+        return "roth"
+    if acct_type in _TRADITIONAL_ACCOUNT_TYPES:
+        return "traditional"
+    if acct_type in _TAXABLE_ACCOUNT_TYPES:
+        return "taxable"
+
     blob = " ".join(
         str(acct.get(k) or "")
-        for k in ("accountType", "accountDesc", "accountName", "accountMode")
+        for k in ("accountDesc", "accountName", "accountMode")
     ).upper()
     if "ROTH" in blob:
         return "roth"
-    retirement = ("IRA", "CONTRIBUTORY", "TRADITIONAL", "401K", "401(K)", "403B", "403(B)", "SEP", "SIMPLE", "PENSION", "RETIREMENT", "COVERDELL", "MONEY_PURCHASE", "PROFIT_SHARING", "INDIVIDUAL_K")
-    if any(marker in blob for marker in retirement):
+    if any(marker in blob for marker in _RETIREMENT_NAME_MARKERS):
         return "traditional"
     return "taxable"
 
@@ -437,49 +466,65 @@ def format_cost_suffix(
     return " | " + "  ".join(parts)
 
 
-def format_taxable_cost_table(results, as_of: datetime) -> str:
-    """Markdown table of taxable positions for the briefing prompt."""
+def account_tail(label: str) -> str:
+    """Last-4 account marker from account_label(), or the full label."""
+    if "…" in (label or ""):
+        return label[label.find("…"):].rstrip(")")
+    return label or ""
+
+
+def format_lot_table(results, as_of: datetime) -> str:
+    """Per-account lot table for the briefing — taxable, IRA, and Roth."""
     header = (
-        "| Ticker | Account | Last | Avg cost | Price paid | Total cost | "
-        "Unrealized P/L | Term | Acquired |\n"
-        "|---|---|---:|---:|---:|---:|---:|---|---|"
+        "| Ticker | Acct | Loc | Avg | Cost | P/L | Term | Acq |\n"
+        "|---|---|---|---:|---:|---:|---|---|"
     )
+    loc_name = {"taxable": "taxable", "traditional": "IRA", "roth": "Roth"}
     rows = []
     for r in results:
-        if r.get("error") or r.get("tax_bucket") != "taxable":
+        if r.get("error"):
             continue
-        label = r.get("label") or ""
-        acct = label[label.find("…"):] if "…" in label else label
-        acct = acct.rstrip(")")
+        bucket = r.get("tax_bucket") or "taxable"
+        loc = loc_name.get(bucket, bucket)
+        acct = account_tail(r.get("label") or "")
         for h in r.get("holdings") or []:
             if is_cash_symbol(h["symbol"]):
                 continue
             split = lot_term_split(h, as_of)
             cps = avg_cost_per_share(h)
-            paid = h.get("price_paid")
             tc = h.get("total_cost")
             tg = h.get("total_gain")
             tgp = gain_pct(h)
-            last = h.get("price") or 0
             pl = "—"
             if tg is not None:
                 pl = fmt_signed_money(tg)
                 if tgp is not None:
                     pl = f"{pl} ({fmt_signed_pct(tgp)})"
-            term = split["term"]
-            if term == "mixed":
-                term = f"mixed LT ${split['lt_mv']:,.0f} / ST ${split['st_mv']:,.0f}"
+            if bucket == "taxable":
+                term = split["term"]
+                if term == "mixed":
+                    term = f"mixed LT ${split['lt_mv']:,.0f} / ST ${split['st_mv']:,.0f}"
+            else:
+                term = "no CG"
             acq = fmt_acq_range(split["earliest"], split["latest"]) or "—"
             rows.append(
-                f"| {h['symbol']} | {acct} | ${last:,.2f} | "
+                f"| {h['symbol']} | {acct} | {loc} | "
                 f"{f'${cps:,.2f}' if cps else '—'} | "
-                f"{f'${paid:,.2f}' if paid else '—'} | "
                 f"{f'${tc:,.0f}' if tc else '—'} | "
                 f"{pl} | {term} | {acq} |"
             )
     if not rows:
-        return "_No taxable equity positions with reportable cost basis._"
+        return "_No equity lots with reportable cost basis._"
     return header + "\n" + "\n".join(rows)
+
+
+def format_taxable_cost_table(results, as_of: datetime) -> str:
+    """Lot table restricted to taxable accounts (tests / diagnostics)."""
+    taxable = [
+        r for r in results
+        if not r.get("error") and (r.get("tax_bucket") or "taxable") == "taxable"
+    ]
+    return format_lot_table(taxable, as_of)
 
 
 def collect_tax_flags(results, as_of: datetime) -> list[str]:
@@ -504,16 +549,18 @@ def collect_tax_flags(results, as_of: datetime) -> list[str]:
             if h.get("total_cost") in (None, 0) and not h.get("price_paid"):
                 missing.append(name)
                 continue
-            if split["st_gain"] > 500 or (
-                split["term"] == "ST" and tg is not None and tg > 500
+            st_flag = POLICY.st_gain_flag_dollars
+            lt_flag = POLICY.lt_gain_flag_dollars
+            if split["st_gain"] > st_flag or (
+                split["term"] == "ST" and tg is not None and tg > st_flag
             ):
                 st_gains.append(
                     f"{name} {fmt_signed_money(split['st_gain'] or (tg or 0))} ST"
                 )
             if tg is not None and tg < POLICY.harvest_loss_dollars:
                 losses.append(f"{name} {fmt_signed_money(tg)}")
-            if split["lt_gain"] > 2000 or (
-                split["term"] == "LT" and tg is not None and tg > 2000
+            if split["lt_gain"] > lt_flag or (
+                split["term"] == "LT" and tg is not None and tg > lt_flag
             ):
                 lt_gains.append(
                     f"{name} {fmt_signed_money(split['lt_gain'] or (tg or 0))} LT"
@@ -521,30 +568,16 @@ def collect_tax_flags(results, as_of: datetime) -> list[str]:
 
     flags = []
     if st_gains:
-        flags.append(
-            "- **Taxable short-term unrealized gains** (selling now = short-term "
-            "capital gains tax): " + "; ".join(st_gains)
-        )
+        flags.append("- Taxable ST gains: " + "; ".join(st_gains))
     if lt_gains:
-        flags.append(
-            "- **Taxable long-term unrealized gains** (prefer these if de-risking "
-            "in the taxable account): " + "; ".join(lt_gains)
-        )
+        flags.append("- Taxable LT gains: " + "; ".join(lt_gains))
     if losses:
-        flags.append(
-            "- **Taxable unrealized losses** (tax-loss harvest candidates if the "
-            "thesis is weak): " + "; ".join(losses)
-        )
+        flags.append("- Taxable losses: " + "; ".join(losses))
     if missing:
         flags.append(
-            "- **Cost basis missing** on taxable: "
+            "- Cost basis missing (do not invent): "
             + ", ".join(sorted(set(missing)))
-            + " — do not invent a purchase price."
         )
-    flags.append(
-        "- Traditional IRA / Roth P/L is **economic only** — do **not** apply "
-        "ST/LT capital-gains tax to Trim/Sell in those accounts."
-    )
     return flags
 
 
@@ -937,10 +970,7 @@ def fetch_portfolio_block(verbose: bool = True, allow_partial: bool = False):
     if verbose:
         print(f"Will fetch {len(selected)} account(s):\n")
         for a in selected:
-            print(
-                f"  - {account_label(a)}  [{a.get('accountIdKey')}]  "
-                f"status={a.get('accountStatus')}"
-            )
+            print(f"  - {account_label(a)}  status={a.get('accountStatus')}")
         print()
 
     results = []
