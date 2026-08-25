@@ -1,6 +1,6 @@
 # E*TRADE → Daily Portfolio Action Briefing
 
-Pulls live E*TRADE positions (all active accounts), builds a **decision-engine** briefing prompt (executive trades first, tax/lot hierarchy, factor sleeves), **copies it to your clipboard**, and saves a dated file. You paste into **grok.com** using your normal Grok/SuperGrok plan.
+Pulls live E*TRADE positions (all active accounts), builds a **decision-support** briefing prompt (executive recommendations first, tax/lot hierarchy, factor sleeves), **copies it to your clipboard**, and saves a dated file. Paste it into your preferred capable model, such as ChatGPT, Grok, or Claude.
 
 Each holding includes E\*TRADE **price paid**, **cost per share**, **total cost**, **unrealized P/L**, and **date acquired**. Taxable lots are labeled **ST** (held ≤ 1 year) or **LT** (held > 1 year). IRA/Roth show economic P/L but are **not** treated as capital-gains events. The prompt also pre-computes **direct AI/semi** vs **broad AI-cycle** weights so concentration is not just the six chip tickers.
 
@@ -31,7 +31,7 @@ python build_briefing_prompt.py
 
 Then:
 
-1. Open [grok.com](https://grok.com)
+1. Open your preferred model
 2. **Ctrl+V** — the full prompt is already on the clipboard
 3. Send
 
@@ -47,12 +47,12 @@ The daily Grok prompt does **not** reprint that dump. Lots appear once, in a sin
 
 | Command | Output |
 |---------|--------|
-| `build_briefing_prompt.py` | Compact decision prompt → clipboard + `prompts/daily_briefing_prompt_YYYY-MM-DD.md` + `briefings/weights_YYYY-MM-DD.json` (for the next day’s delta) |
+| `build_briefing_prompt.py` | Compact decision-support prompt → clipboard + dated prompt + `weights_*.json` portfolio deltas + `observations_*.json` account/quantity/lot reconciliation |
 | `get_portfolio.py` | Full per-account dump (cost / P/L / ST-LT) → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` — local diagnostic, not pasted into Grok |
 
-### What the briefing asks Grok to decide
+### What the briefing asks the model to analyze
 
-The prompt is a **decision engine**, not a holdings dump. Grok is required to:
+The prompt is a **decision-support engine**, not a holdings dump. The model has no trading authority and its output is an analytical proposal, not an approved or submitted trade. It is required to:
 
 - Lead with **Trade / No trade** and a **confidence** (no-trade can be high conviction)
 - Prefer the **smallest dollar cut** that actually fixes a limit (e.g. restore 15%, not “sell 15% of the name”)
@@ -61,8 +61,16 @@ The prompt is a **decision engine**, not a holdings dump. Grok is required to:
 - Treat **Replace** as sell + a named replacement (cash is Reduce / Deploy, not Replace)
 - Respect **wash-sale** on taxable losses
 - Include a **horizon** on every action and a directional **stress** (Nasdaq −10%, semi −15%, etc.) — no fake VaR
+- Separate **Fundamental View** from **Portfolio Action**
+- Reconcile prior proposals when they are available and justify every reversal with dated evidence
+- Treat observable TLH and concentration flags as reviews, not orders
 
-It also injects a **daily delta** vs the prior pull (weight moves ≥ 0.5 pp, factor sleeves, 15% breaches). The first run after a gap has no snapshot and says so.
+It injects two independent deltas:
+
+- A **portfolio delta** vs the prior pull (weight moves ≥ 0.5 pp, factor sleeves, 15% breaches)
+- An **observed account delta** using per-account quantities and lot identity (position appeared/disappeared, quantity increased/decreased, lot identity changed, or no execution detected)
+
+Observed E*TRADE changes establish that account values changed, but without transaction or order evidence they do not prove a buy or sale; transfers, splits, and other corporate actions can also change positions. They do not establish motive or whether a prior model proposal was approved. The clipboard workflow also cannot capture the model response automatically, so prior model proposals remain `NOT CAPTURED` unless a future response-import/API layer supplies them.
 
 ---
 
@@ -128,7 +136,7 @@ Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
 | `portfolio_policy.py` | Loads and validates that JSON |
 | `.env` | Secrets (gitignored) |
 | `.env.example` | Template for secrets |
-| `briefings/` | Dated portfolio blocks + `weights_YYYY-MM-DD.json` snapshots (gitignored) |
+| `briefings/` | Dated portfolio blocks + weight and observation snapshots (gitignored) |
 | `prompts/` | Dated full briefing prompts (gitignored) |
 
 ---

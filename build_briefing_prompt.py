@@ -14,17 +14,18 @@ import re
 from argparse import ArgumentParser
 from collections import defaultdict
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 
 from get_portfolio import (
     account_tail,
+    atomic_write_text,
     collect_tax_flags,
     copy_to_clipboard,
     fetch_portfolio_block,
     format_lot_table,
     is_cash_symbol,
     save_portfolio_block,
-    atomic_write_text,
 )
 from portfolio_policy import POLICY
 
@@ -61,6 +62,7 @@ def broad_ai_sleeve_label() -> str:
         return "direct + " + " ".join(extras)
     return "direct"
 
+
 def consolidate(results, grand_total: float):
     by_sym: dict[str, dict] = defaultdict(
         lambda: {
@@ -85,11 +87,13 @@ def consolidate(results, grand_total: float):
         if r.get("error"):
             continue
         bucket = r.get("tax_bucket") or "taxable"
-        accounts.append({
-            "label": r["label"],
-            "total": r["total_value"],
-            "tax_bucket": bucket,
-        })
+        accounts.append(
+            {
+                "label": r["label"],
+                "total": r["total_value"],
+                "tax_bucket": bucket,
+            }
+        )
         for h in r["holdings"]:
             s = h["symbol"]
             d = by_sym[s]
@@ -110,13 +114,15 @@ def consolidate(results, grand_total: float):
             if h.get("lots"):
                 d["lots"].extend(h["lots"])
             elif h.get("date_acquired"):
-                d["lots"].append({
-                    "qty": qty,
-                    "total_cost": h.get("total_cost") or 0.0,
-                    "total_gain": h.get("total_gain") or 0.0,
-                    "market_value": h.get("market_value") or 0.0,
-                    "acquired": h["date_acquired"],
-                })
+                d["lots"].append(
+                    {
+                        "qty": qty,
+                        "total_cost": h.get("total_cost") or 0.0,
+                        "total_gain": h.get("total_gain") or 0.0,
+                        "market_value": h.get("market_value") or 0.0,
+                        "acquired": h["date_acquired"],
+                    }
+                )
             d["tax_buckets"].add(bucket)
             if bucket == "taxable":
                 d["taxable_mv"] += h["market_value"]
@@ -131,34 +137,32 @@ def consolidate(results, grand_total: float):
         w = (mv / grand_total * 100) if grand_total else 0
         qty = d["qty"]
         cps = (d["total_cost"] / qty) if qty and d["cost_known"] else None
-        paid = (
-            d["price_paid_num"] / d["price_paid_den"]
-            if d["price_paid_den"]
-            else None
-        )
+        paid = d["price_paid_num"] / d["price_paid_den"] if d["price_paid_den"] else None
         tgp = (
             100.0 * d["total_gain"] / d["total_cost"]
             if d["cost_known"] and d["total_cost"]
             else None
         )
-        holdings.append({
-            "symbol": sym,
-            "market_value": mv,
-            "weight": w,
-            "price": d["price"],
-            "alias": ALIASES.get(sym),
-            "quantity": qty,
-            "cost_per_share": cps,
-            "price_paid": paid,
-            "total_cost": d["total_cost"] if d["cost_known"] else None,
-            "total_gain": d["total_gain"] if d["gain_known"] else None,
-            "total_gain_pct": tgp,
-            "lots": d["lots"],
-            "tax_buckets": d["tax_buckets"],
-            "taxable_mv": d["taxable_mv"],
-            "ira_mv": d["ira_mv"],
-            "roth_mv": d["roth_mv"],
-        })
+        holdings.append(
+            {
+                "symbol": sym,
+                "market_value": mv,
+                "weight": w,
+                "price": d["price"],
+                "alias": ALIASES.get(sym),
+                "quantity": qty,
+                "cost_per_share": cps,
+                "price_paid": paid,
+                "total_cost": d["total_cost"] if d["cost_known"] else None,
+                "total_gain": d["total_gain"] if d["gain_known"] else None,
+                "total_gain_pct": tgp,
+                "lots": d["lots"],
+                "tax_buckets": d["tax_buckets"],
+                "taxable_mv": d["taxable_mv"],
+                "ira_mv": d["ira_mv"],
+                "roth_mv": d["roth_mv"],
+            }
+        )
     return holdings, accounts
 
 
@@ -176,10 +180,7 @@ def holding_line(h: dict, as_of) -> str:
     alias = f" ({h['alias']})" if h.get("alias") else ""
     sym = h["symbol"]
     if is_cash_symbol(sym):
-        return (
-            f"- Cash ({sym}) ≈ {fmt_money(h['market_value'])} "
-            f"(~{fmt_weight(h['weight'])})"
-        )
+        return f"- Cash ({sym}) ≈ {fmt_money(h['market_value'])} (~{fmt_weight(h['weight'])})"
     bits = []
     tgp = h.get("total_gain_pct")
     if tgp is not None:
@@ -211,7 +212,64 @@ def sleeve_stats(holdings: list[dict], symbols: tuple[str, ...], total: float):
     return mv, w, [h["symbol"] for h in members]
 
 
-def must_analyze_holdings(holdings: list[dict]) -> list[dict]:
+def taxable_harvest_reviews(results) -> list[dict]:
+    """Return account-level taxable-loss reviews from the source positions.
+
+    This deliberately avoids consolidated ticker P/L: an IRA gain in the same
+    ticker must not hide a taxable loss that still requires review.
+    """
+    reviews = []
+    for result in results or []:
+        if result.get("error") or result.get("tax_bucket") != "taxable":
+            continue
+        label = result.get("label") or "Taxable account"
+        for holding in result.get("holdings") or []:
+            symbol = holding.get("symbol") or ""
+            if not symbol or is_cash_symbol(symbol):
+                continue
+            market_value = holding.get("market_value") or 0.0
+            total_gain = holding.get("total_gain")
+            if (
+                market_value >= ANALYZE_MV_FLOOR
+                and total_gain is not None
+                and total_gain < HARVEST_LOSS_DOLLARS
+            ):
+                reviews.append(
+                    {
+                        "symbol": symbol,
+                        "account": account_tail(label) or label,
+                        "quantity": holding.get("quantity") or 0.0,
+                        "market_value": market_value,
+                        "total_gain": total_gain,
+                    }
+                )
+    return reviews
+
+
+def format_observable_reviews(harvest_reviews: list[dict], breaches: list[dict]) -> str:
+    """Format deterministic review flags. These are never approvals or orders."""
+    lines = []
+    for row in harvest_reviews:
+        loss = fmt_money(abs(row["total_gain"]))
+        lines.append(
+            f"- **{row['symbol']} / {row['account']} — OPEN_TLH_REVIEW:** "
+            f"qty {row['quantity']:,.4g}; MV {fmt_money(row['market_value'])}; "
+            f"unrealized loss -{loss}. Review only — not an approved sale or order."
+        )
+    for holding in breaches:
+        lines.append(
+            f"- **{holding['symbol']} — CONCENTRATION_REVIEW:** "
+            f"{fmt_weight(holding['weight'])} exceeds the "
+            f"{SINGLE_NAME_CAP:g}% soft maximum. Review only — not an approved sale."
+        )
+    if not lines:
+        return "- No automated TLH or single-name concentration review flags."
+    return "\n".join(lines)
+
+
+def must_analyze_holdings(
+    holdings: list[dict], required_harvest_symbols: set[str] | None = None
+) -> list[dict]:
     """Names that must appear in the briefing position table.
 
     Harvest and material-loss names stay in even when they sit under the weight floor.
@@ -227,18 +285,20 @@ def must_analyze_holdings(holdings: list[dict]) -> list[dict]:
             reasons.append("weight")
         tg = h.get("total_gain")
         tgp = h.get("total_gain_pct")
-        taxable_mv = h.get("taxable_mv") or 0.0
         sized = mv >= ANALYZE_MV_FLOOR
+        if required_harvest_symbols is not None:
+            harvest_required = sym in required_harvest_symbols
+        else:
+            taxable_mv = h.get("taxable_mv") or 0.0
+            harvest_required = (
+                sized and taxable_mv > 0 and tg is not None and tg < HARVEST_LOSS_DOLLARS
+            )
+        if harvest_required:
+            reasons.append("harvest")
         if (
             sized
-            and taxable_mv > 0
             and tg is not None
-            and tg < HARVEST_LOSS_DOLLARS
-        ):
-            reasons.append("harvest")
-        if sized and tg is not None and (
-            tg <= MATERIAL_LOSS_DOLLARS
-            or (tgp is not None and tgp <= MATERIAL_LOSS_PCT)
+            and (tg <= MATERIAL_LOSS_DOLLARS or (tgp is not None and tgp <= MATERIAL_LOSS_PCT))
         ):
             reasons.append("loss")
         if reasons:
@@ -253,9 +313,7 @@ def format_must_analyze(rows: list[dict]) -> str:
     extra = [r for r in rows if "weight" not in r["analyze_reasons"]]
     lines = []
     if weight:
-        lines.append(
-            f"- Weight ≥ {ANALYZE_WEIGHT_FLOOR:g}%: " + ", ".join(weight)
-        )
+        lines.append(f"- Weight ≥ {ANALYZE_WEIGHT_FLOOR:g}%: " + ", ".join(weight))
     if extra:
         bits = []
         for row in extra:
@@ -270,7 +328,6 @@ def format_must_analyze(rows: list[dict]) -> str:
     if not lines:
         return "- None"
     return "\n".join(lines)
-
 
 
 def min_cut_to_cap(mv: float, total: float, cap_pct: float) -> float:
@@ -313,6 +370,216 @@ def save_weights_snapshot(snap: dict, as_of: datetime) -> Path:
     return dated
 
 
+def _account_ref(result: dict) -> str:
+    """Stable non-secret account reference for local snapshot comparisons."""
+    key = str(result.get("account_id_key") or result.get("label") or "unknown")
+    return sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def _snapshot_date(value) -> str | None:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if value:
+        return str(value)
+    return None
+
+
+def observation_snapshot_dict(
+    results,
+    harvest_reviews: list[dict],
+    breaches: list[dict],
+    as_of: datetime,
+) -> dict:
+    """Build per-account position state for next-run execution reconciliation."""
+    positions = []
+    for result in results or []:
+        if result.get("error"):
+            continue
+        account_ref = _account_ref(result)
+        account = account_tail(result.get("label") or "") or "account"
+        tax_bucket = result.get("tax_bucket") or "taxable"
+        for holding in result.get("holdings") or []:
+            symbol = holding.get("symbol") or ""
+            if not symbol:
+                continue
+            lots = []
+            for lot in holding.get("lots") or []:
+                lots.append(
+                    {
+                        "quantity": lot.get("qty") or 0.0,
+                        "acquired": _snapshot_date(lot.get("acquired")),
+                        "term_code": lot.get("term_code"),
+                        "total_cost": lot.get("total_cost") or 0.0,
+                    }
+                )
+            lots.sort(
+                key=lambda lot: (
+                    lot.get("acquired") or "",
+                    lot.get("quantity") or 0.0,
+                    lot.get("total_cost") or 0.0,
+                )
+            )
+            positions.append(
+                {
+                    "account_ref": account_ref,
+                    "account": account,
+                    "tax_bucket": tax_bucket,
+                    "position_id": str(holding.get("position_id") or ""),
+                    "symbol": symbol,
+                    "quantity": holding.get("quantity") or 0.0,
+                    "price": holding.get("price") or 0.0,
+                    "market_value": holding.get("market_value") or 0.0,
+                    "total_cost": holding.get("total_cost"),
+                    "total_gain": holding.get("total_gain"),
+                    "lots": lots,
+                }
+            )
+    positions.sort(key=lambda row: (row["account_ref"], row["symbol"]))
+    reviews = [
+        {
+            "kind": "OPEN_TLH_REVIEW",
+            "symbol": row["symbol"],
+            "account": row["account"],
+        }
+        for row in harvest_reviews
+    ]
+    reviews.extend(
+        {
+            "kind": "CONCENTRATION_REVIEW",
+            "symbol": holding["symbol"],
+            "account": "consolidated",
+        }
+        for holding in breaches
+    )
+    reviews.sort(key=lambda row: (row["kind"], row["symbol"], row["account"]))
+    return {
+        "schema_version": 1,
+        "as_of": as_of.isoformat(),
+        "date": as_of.strftime("%Y-%m-%d"),
+        "positions": positions,
+        "reviews": reviews,
+    }
+
+
+def save_observation_snapshot(snap: dict, as_of: datetime) -> Path:
+    BRIEFINGS_DIR.mkdir(exist_ok=True)
+    dated = BRIEFINGS_DIR / f"observations_{as_of.strftime('%Y-%m-%d')}.json"
+    latest = BRIEFINGS_DIR / "observations_latest.json"
+    text = json.dumps(snap, indent=2)
+    atomic_write_text(dated, text)
+    atomic_write_text(latest, text)
+    return dated
+
+
+def load_prior_observation(as_of: datetime) -> tuple[dict | None, str]:
+    today = as_of.strftime("%Y-%m-%d")
+    paths = sorted(BRIEFINGS_DIR.glob("observations_20*.json"), reverse=True)
+    for path in paths:
+        if today in path.name:
+            continue
+        try:
+            return json.loads(path.read_text(encoding="utf-8")), path.name
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None, ""
+
+
+def _position_key(row: dict) -> tuple[str, str]:
+    return str(row.get("account_ref") or ""), str(row.get("symbol") or "")
+
+
+def _lot_identity(row: dict) -> list[tuple]:
+    return [
+        (
+            lot.get("acquired"),
+            round(float(lot.get("quantity") or 0.0), 8),
+            round(float(lot.get("total_cost") or 0.0), 2),
+        )
+        for lot in row.get("lots") or []
+    ]
+
+
+def format_observed_delta(today: dict, prior: dict | None, prior_label: str) -> str:
+    """Describe observable position changes without inferring user intent."""
+    if not prior:
+        return (
+            "- No prior observation snapshot yet. Quantity/lot account-change "
+            "reconciliation begins on the next run."
+        )
+
+    label = prior.get("date") or prior.get("as_of") or prior_label
+    lines = [f"Compared with **{label}** (`{prior_label}`):"]
+    previous = {_position_key(row): row for row in prior.get("positions") or []}
+    current = {_position_key(row): row for row in today.get("positions") or []}
+    events = []
+    for key in sorted(set(previous) | set(current)):
+        old = previous.get(key)
+        new = current.get(key)
+        row = new or old or {}
+        symbol = row.get("symbol") or "?"
+        account = row.get("account") or "account"
+        if is_cash_symbol(symbol):
+            continue
+        if old is None:
+            events.append(
+                f"- **POSITION_APPEARED:** {symbol} / {account}, "
+                f"qty {float(new.get('quantity') or 0.0):,.4g}. Possible buy, "
+                "transfer, or corporate action; execution is not confirmed."
+            )
+            continue
+        if new is None:
+            events.append(
+                f"- **POSITION_DISAPPEARED:** {symbol} / {account}, prior qty "
+                f"{float(old.get('quantity') or 0.0):,.4g}. Possible full sale, "
+                "transfer, or corporate action; execution is not confirmed."
+            )
+            continue
+        old_qty = float(old.get("quantity") or 0.0)
+        new_qty = float(new.get("quantity") or 0.0)
+        tolerance = max(1e-6, abs(old_qty) * 1e-8)
+        if new_qty > old_qty + tolerance:
+            events.append(
+                f"- **QUANTITY_INCREASE:** {symbol} / {account}, "
+                f"qty {old_qty:,.4g} → {new_qty:,.4g}. Possible buy, transfer, "
+                "or corporate action; execution is not confirmed."
+            )
+        elif new_qty < old_qty - tolerance:
+            events.append(
+                f"- **QUANTITY_DECREASE:** {symbol} / {account}, "
+                f"qty {old_qty:,.4g} → {new_qty:,.4g}. Possible sale, transfer, "
+                "or corporate action; execution is not confirmed."
+            )
+        elif _lot_identity(old) != _lot_identity(new):
+            events.append(
+                f"- **LOT_IDENTITY_CHANGE:** {symbol} / {account} with unchanged "
+                "net quantity. Treat as review-required, not a confirmed trade."
+            )
+    if events:
+        lines.extend(events)
+    else:
+        lines.append(
+            "- No quantity or lot-identity change detected. This means **NO "
+            "EXECUTION DETECTED**; it does not establish approval, rejection, or intent."
+        )
+
+    prior_reviews = {
+        (row.get("kind"), row.get("symbol"), row.get("account"))
+        for row in prior.get("reviews") or []
+    }
+    today_reviews = {
+        (row.get("kind"), row.get("symbol"), row.get("account"))
+        for row in today.get("reviews") or []
+    }
+    for kind, symbol, account in sorted(today_reviews - prior_reviews):
+        lines.append(f"- **Review opened:** {symbol} / {account} — {kind}.")
+    for kind, symbol, account in sorted(prior_reviews - today_reviews):
+        lines.append(
+            f"- **Review cleared by observable data:** {symbol} / {account} — "
+            f"{kind}. Do not infer why."
+        )
+    return "\n".join(lines)
+
+
 _HOLDING_LINE_RE = re.compile(
     r"^- ([A-Z][A-Z0-9.]*)(?: \([^)]+\))? ([\d.]+)%\s+"
     r"\(\$?([0-9,.]+(?:M)?) @ \$([\d.]+)"
@@ -338,12 +605,14 @@ def parse_snapshot_from_prompt(text: str) -> dict | None:
                 break
             m = _HOLDING_LINE_RE.match(line)
             if m:
-                holdings.append({
-                    "symbol": m.group(1),
-                    "weight": float(m.group(2)),
-                    "market_value": _parse_money_token(m.group(3)),
-                    "price": float(m.group(4)),
-                })
+                holdings.append(
+                    {
+                        "symbol": m.group(1),
+                        "weight": float(m.group(2)),
+                        "market_value": _parse_money_token(m.group(3)),
+                        "price": float(m.group(4)),
+                    }
+                )
     if not holdings:
         return None
 
@@ -354,17 +623,21 @@ def parse_snapshot_from_prompt(text: str) -> dict | None:
                 return float(m.group(1))
         return None
 
-    cluster_w = _pct([
-        r"Direct AI/semi[^\n]*?\*\*([\d.]+)%\*\*",
-        r"pure AI/semi cluster[^\n]*?([\d.]+)%",
-    ])
+    cluster_w = _pct(
+        [
+            r"Direct AI/semi[^\n]*?\*\*([\d.]+)%\*\*",
+            r"pure AI/semi cluster[^\n]*?([\d.]+)%",
+        ]
+    )
     broad_w = _pct([r"Broad AI-cycle liquid[^\n]*?\*\*([\d.]+)%\*\*"])
-    cash_w = _pct([
-        r"Cash \+ cash equivalents:[^\n]*?\(([\d.]+)%\)",
-        r"Cash \+ cash equivalents[^\n]*?\(([\d.]+)%\)",
-        r"Cash \(SGOV\):[^\n]*?\(([\d.]+)%\)",
-        r"Cash \(SGOV\)[^\n]*?~([\d.]+)%",
-    ])
+    cash_w = _pct(
+        [
+            r"Cash \+ cash equivalents:[^\n]*?\(([\d.]+)%\)",
+            r"Cash \+ cash equivalents[^\n]*?\(([\d.]+)%\)",
+            r"Cash \(SGOV\):[^\n]*?\(([\d.]+)%\)",
+            r"Cash \(SGOV\)[^\n]*?~([\d.]+)%",
+        ]
+    )
     top5_w = _pct([r"Top-5[^\n]*?([\d.]+)%"])
     return {
         "as_of": "prior briefing",
@@ -375,7 +648,8 @@ def parse_snapshot_from_prompt(text: str) -> dict | None:
         "top5_w": top5_w,
         "holdings": holdings,
         "breaches": [
-            h["symbol"] for h in holdings
+            h["symbol"]
+            for h in holdings
             if h["weight"] > SINGLE_NAME_CAP and not is_cash_symbol(h["symbol"])
         ],
     }
@@ -431,8 +705,7 @@ def format_daily_delta(today_snap: dict, prior: dict | None, prior_label: str) -
         elif abs(tw - pw) >= 0.5:
             sign = "+" if tw > pw else ""
             material.append(
-                f"- **{sym}** {fmt_weight(pw)} → {fmt_weight(tw)} "
-                f"({sign}{tw - pw:.1f} pp)"
+                f"- **{sym}** {fmt_weight(pw)} → {fmt_weight(tw)} ({sign}{tw - pw:.1f} pp)"
             )
     if material:
         lines.extend(material)
@@ -469,9 +742,7 @@ def format_daily_delta(today_snap: dict, prior: dict | None, prior_label: str) -
             f"- **{SINGLE_NAME_CAP:g}% breach cleared:** " + ", ".join(sorted(prior_br - today_br))
         )
     if today_br and today_br == prior_br:
-        lines.append(
-            f"- {SINGLE_NAME_CAP:g}% breach **unchanged:** " + ", ".join(sorted(today_br))
-        )
+        lines.append(f"- {SINGLE_NAME_CAP:g}% breach **unchanged:** " + ", ".join(sorted(today_br)))
     lines.append(
         "Treat these as market-move vs thesis-move in Daily Delta. "
         "Do not repeat unchanged analysis."
@@ -485,9 +756,7 @@ def format_constraint_math(holdings, grand_total: float, cluster_mv: float) -> s
         if is_cash_symbol(h["symbol"]) or h["weight"] <= SINGLE_NAME_CAP:
             continue
         cut = min_cut_to_cap(h["market_value"], grand_total, SINGLE_NAME_CAP)
-        new_w = (
-            (h["market_value"] - cut) / grand_total * 100 if grand_total else 0
-        )
+        new_w = (h["market_value"] - cut) / grand_total * 100 if grand_total else 0
         lines.append(
             f"- **{h['symbol']}** {fmt_weight(h['weight'])}: "
             f"min **{fmt_money(cut)}** to restore {SINGLE_NAME_CAP:g}% "
@@ -546,33 +815,29 @@ def format_marginal_10k(
         rows.append(row(label, d_direct, d_broad, -unit, d_top5, extra))
 
     overweight = next(
-        (
-            h for h in holdings
-            if not is_cash_symbol(h["symbol"])
-            and h["weight"] > SINGLE_NAME_CAP
-        ),
+        (h for h in holdings if not is_cash_symbol(h["symbol"]) and h["weight"] > SINGLE_NAME_CAP),
         None,
     )
     if overweight:
         symbol = overweight["symbol"]
-        cut_to_cap = min_cut_to_cap(
-            overweight["market_value"], grand_total, SINGLE_NAME_CAP
-        )
+        cut_to_cap = min_cut_to_cap(overweight["market_value"], grand_total, SINGLE_NAME_CAP)
         direct_delta = -unit if symbol in AI_SEMI_CLUSTER else 0.0
         broad_delta = -unit if symbol in BROAD_AI_LIQUID else 0.0
         top5_delta = -unit if symbol in top5_syms else 0.0
-        rows.extend([
-            "",
-            (
-                f"Sell $10k **{symbol}** → cash: Δ direct {direct_delta:+.2f} pp, "
-                f"Δ broad {broad_delta:+.2f}, Δ cash {unit:+.2f}, "
-                f"Δ top-5 {top5_delta:+.2f}. {symbol} "
-                f"{fmt_weight(overweight['weight'])} → "
-                f"{fmt_weight(overweight['weight'] - unit)}. "
-                f"Minimum to restore {SINGLE_NAME_CAP:g}% is "
-                f"{fmt_money(cut_to_cap)}."
-            ),
-        ])
+        rows.extend(
+            [
+                "",
+                (
+                    f"Sell $10k **{symbol}** → cash: Δ direct {direct_delta:+.2f} pp, "
+                    f"Δ broad {broad_delta:+.2f}, Δ cash {unit:+.2f}, "
+                    f"Δ top-5 {top5_delta:+.2f}. {symbol} "
+                    f"{fmt_weight(overweight['weight'])} → "
+                    f"{fmt_weight(overweight['weight'] - unit)}. "
+                    f"Minimum to restore {SINGLE_NAME_CAP:g}% is "
+                    f"{fmt_money(cut_to_cap)}."
+                ),
+            ]
+        )
     rows.append(
         f"$10k = **{unit:.2f} pp** of liquid ({fmt_money(grand_total)}). "
         "Use this unit on every proposed buy/sell."
@@ -630,11 +895,12 @@ def build_prompt(
         account_bits.append(f"  - {shown}{loc_note}: ≈ {fmt_money(a['total'])}")
     account_lines = "\n".join(account_bits) if account_bits else "  - _No funded accounts._"
 
-    holdings_lines = "\n".join(
-        holding_line(h, as_of) for h in holdings if h["market_value"] >= 50
-    )
-    analyze_rows = must_analyze_holdings(holdings)
+    holdings_lines = "\n".join(holding_line(h, as_of) for h in holdings if h["market_value"] >= 50)
+    harvest_reviews = taxable_harvest_reviews(results)
+    harvest_symbols = {row["symbol"] for row in harvest_reviews}
+    analyze_rows = must_analyze_holdings(holdings, harvest_symbols)
     must_analyze_block = format_must_analyze(analyze_rows)
+    observable_review_block = format_observable_reviews(harvest_reviews, breaches)
 
     if cluster_w >= CLUSTER_SOFT_CAP:
         cluster_status = (
@@ -670,12 +936,22 @@ def build_prompt(
     prior_snap, prior_label = load_prior_snapshot(as_of)
     save_weights_snapshot(today_snap, as_of)
     daily_delta = format_daily_delta(today_snap, prior_snap, prior_label)
-    constraint_math = format_constraint_math(holdings, grand_total, cluster_mv)
-    marginal_10k = format_marginal_10k(
-        holdings, grand_total, cluster_mv, broad_mv, cash_mv, top5_w
+    today_observation = observation_snapshot_dict(results, harvest_reviews, breaches, as_of)
+    prior_observation, prior_observation_label = load_prior_observation(as_of)
+    save_observation_snapshot(today_observation, as_of)
+    observed_delta = format_observed_delta(
+        today_observation, prior_observation, prior_observation_label
     )
+    constraint_math = format_constraint_math(holdings, grand_total, cluster_mv)
+    marginal_10k = format_marginal_10k(holdings, grand_total, cluster_mv, broad_mv, cash_mv, top5_w)
 
-    prompt = f"""You are the PM for this book, not a screener. Actions: **Keep / Reduce / Replace / Deploy**. A sale names **this ticker, this account, this lot**. Use the As-of marks. Do not invent prices, cost, dates, or ST/LT.
+    prompt = f"""You are a portfolio decision-support and risk analyst assisting the account owner. Analyze the whole portfolio rather than screening stocks independently.
+
+You may recommend actions, but you have no trading authority. Recommendations are proposals for human review — not instructions, approvals, open orders, or evidence that a trade will be executed.
+
+Allowed **Portfolio Action** values are exactly: **KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION**. A proposed sale names **this ticker, this account, this lot or lot group, this quantity, and this dollar amount**. Use the supplied As-of marks. Never invent prices, costs, dates, quantities, tax treatment, execution status, or ST/LT classification.
+
+Separate verified facts, supplied calculations, assumptions, analytical judgment, and missing information. When required information is missing or conflicting, use **NO ACTION / NEEDS REVIEW** rather than manufacturing conviction.
 
 Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
 
@@ -683,12 +959,23 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 
 # 1. Live book
 
-**As of:** {as_of_str} {as_of.tzname() or 'ET'}
+**As of:** {as_of_str} {as_of.tzname() or "ET"}
 **E*TRADE total ≈ {fmt_money(grand_total)}**
 **Top-5 (E*TRADE):** {fmt_weight(top5_w)} · **Cash + cash equivalents:** {fmt_money(cash_mv)} ({fmt_weight(cash_w)})
 
 **Daily delta:**
 {daily_delta}
+
+**Observed account delta** (E*TRADE position evidence only):
+{observed_delta}
+
+**Observable review state** (generated from E*TRADE; reviews, not orders):
+{observable_review_block}
+
+- **OPEN_TLH_REVIEW** means a qualifying taxable loss remains present. It does not mean a sale was recommended or approved.
+- **CONCENTRATION_REVIEW** means a supplied soft limit is exceeded. It does not mean a sale was approved.
+- **POSITION/QUANTITY/LOT changes** describe observable account changes only. Without transaction or order evidence, they do not prove a trade, motive, or approval.
+- **NO EXECUTION DETECTED** does not establish whether any prior proposal was approved, rejected, or deferred.
 
 **Factor sleeves (do not invent %):**
 - Direct AI/semi ({direct_members}): **{fmt_weight(cluster_w)}** / {fmt_money(cluster_mv)} — {cluster_status}
@@ -723,23 +1010,35 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 
 **Limits.** Single-name soft max **{SINGLE_NAME_CAP:g}%**. Use the pre-computed min $ — do not sell a {SINGLE_NAME_CAP:g}% slice of a name because it is slightly over. Direct AI/semi: do not add at ≥ {CLUSTER_NO_ADD:g}% (now {fmt_weight(cluster_w)}). Soft ceiling **{CLUSTER_SOFT_CAP:g}%**; holding above is allowed only if cutting is punitive ST — never raise the ceiling. Risk-Off: work *toward* {RISK_OFF_GLIDE:g}% via tax-aware lots only.
 
-**Tax.** No ST/LT capital-gains tax on Traditional IRA / Roth. Wash-sale: do not harvest and immediately buy the same or substantially identical name unless implications are explicit; if unclear, do not treat the loss as usable.
+**Authority and state.** E*TRADE establishes observed holdings and executions; it does not establish intent. A prior model recommendation, when supplied, is historical analytical context — never an approval or order. Never infer **USER APPROVED** from model text or **NO EXECUTION DETECTED** from approval status.
+
+**Decision continuity.** This is a continuing portfolio review, not a fresh stock screen. For every prior model proposal supplied in the input, classify today's proposal as **UNCHANGED / MODIFIED / REVERSED / RESOLVED**. If no prior proposal was captured, say **NOT CAPTURED**; do not reconstruct it from position data.
+
+A MODIFIED or REVERSED proposal requires at least one qualifying delta: material company-specific evidence; earnings/guidance/regulatory/competitive change; price or valuation movement material to the original thesis; portfolio-weight/factor/liquidity/tax change; observed execution; or a specific error in the prior analysis. State the prior proposal, new proposal, dated new fact, invalidated assumption, and why the change is sufficient. “Reassessment,” “updated outlook,” “fresh analysis,” and “greater upside” are not sufficient.
+
+**Fundamental view ≠ portfolio action.** Report both independently. Fundamental View is **ATTRACTIVE / NEUTRAL / UNATTRACTIVE / INSUFFICIENT EVIDENCE**. Portfolio Action uses only **KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION**. A fundamentally attractive or neutral security may still warrant REDUCE or REPLACE because of concentration, TLH, account location, factor exposure, opportunity cost, or a superior replacement. A negative view does not automatically justify a sale when tax, evidence, sizing, or replacement quality argues for NO ACTION.
+
+**Tax.** No ST/LT capital-gains tax on Traditional IRA / Roth. A taxable loss creates a review candidate, not an automatic sale. Wash-sale status must be **CLEAR / POSSIBLE / UNKNOWN** and must state the information scope checked. If relevant accounts, spouse activity, automatic purchases, options, open orders, or the surrounding 61-day transaction window are unavailable, do not claim the loss is usable; say **NEEDS TAX REVIEW**.
 
 **Hierarchy.** (1) concentration / drawdown (2) do not tidy a working thesis — #2 cannot veto a hard #1 (3) risk-adjusted return (4) tax/friction (5) deploy cash only if return beats liquidity. #1 beats #3 and #4. #4 beats incremental #3.
 
-**Trade bar.** Prefer **no trade** when benefit does not clearly exceed tax/friction. Forced: hard limit; thesis break; unacceptable downside or factor drawdown; or valuation so poor that expected return no longer pays for the risk and tax. Hold is a valid high-conviction call. Do not manufacture trades.
+**Trade bar.** Prefer **NO ACTION** when benefit does not clearly exceed tax/friction or evidence is incomplete. A proposed trade requires a hard limit, thesis break, unacceptable downside/factor drawdown, or valuation so poor that expected return no longer pays for risk and tax. KEEP and NO ACTION can be high-conviction calls. Do not manufacture trades.
 
 **Sizing.** On a breach: use the pre-computed min $, compare a larger cut, pick the smallest that actually fixes the problem. Do not sell more because it is profitable. {SINGLE_NAME_CAP:g}% is a ceiling, not a target. High-vol names get a tighter cap. Conviction uses remaining budget after caps.
 
 **Factor.** Every buy shows Δ direct / Δ broad / Δ cash / Δ top-5 from the $10k table. Broad members ({broad_members}) share the AI-capex tape — ticker diversity ≠ factor diversity. Buy: why this $10k vs the best 2 names already held. Sale: why this reducer rather than another.
 
-**Replace** = named sale + named buy (cash is Reduce/Deploy). State risk removed, risk added, tax, and why expected R/R is better.
+**REPLACE** = named sale + named buy; moving to cash is REDUCE and later investing cash is DEPLOY. State risk removed, risk added, tax, wash-sale status/scope, and why expected risk/reward is better.
 
-**Thesis vs price.** Score thesis · valuation · trend · catalyst separately. Horizon on every action. Price is a trigger, not a thesis — classify moves as market / factor / company / noise. Harvest only taxable losses, and only if thesis is weak, wash-sale is clear, and tax benefit is worth it.
+**Thesis vs price.** Score thesis · valuation · trend · catalyst separately. Price is a trigger, not a thesis — classify moves as market / factor / company / execution / noise. Use a decision trigger, not a vague standalone “hold 6–12 months” horizon.
 
-**New ideas.** Only with cash/proceeds, must not raise direct AI/semi, must pass the $10k test.
+**TLH proposal requirements.** REDUCE or REPLACE for TLH must state: exact taxable account and lot/lot group; quantity and expected realized loss; wash-sale status and scope; named replacement or explicit cash destination; exposure preserved or intentionally changed; and why expected after-tax benefit exceeds spread, complexity, and opportunity cost. Fundamental weakness is not required, but the portfolio case must stand on its own.
 
-# 3. Tax engine (Trim/Sell only)
+**Evidence.** Any company-specific fact that initiates, modifies, or reverses an action needs a source and event/publication date. Prefer filings, earnings releases, transcripts, and regulator/company sources. Label unsourced claims and forecasts as assumptions. If current evidence cannot be verified, use INSUFFICIENT EVIDENCE and do not reverse a prior proposal on that basis.
+
+**New ideas.** Include **2–3 securities not currently held** as research candidates in every briefing. Favor ideas that improve diversification and do not raise direct AI/semi exposure. For each: give the portfolio role, current sourced thesis and catalyst, principal risk, valuation/entry discipline, an observable decision trigger, and the supplied $10k factor/cash/top-5 impact. Compare it with the best two relevant names already held and with the other new candidates; if no relevant holding exists, say so. A research candidate is not automatically a trade: assign Portfolio Action **DEPLOY** only when cash/proceeds are available and the idea clears the trade bar; otherwise assign **NO ACTION**, mark Candidate Status **WATCH**, and state what would make it deployable. Do not invent live prices or valuation facts that cannot be verified.
+
+# 3. Tax engine (REDUCE/REPLACE only)
 
 A ticker is not one lot (taxable LT ≠ taxable ST ≠ IRA). Compare at least two sleeves. Pick account/lot on: risk removed · tax · thesis of what you sell · leftover factor · ST→LT optionality. Tax-free ≠ correct sleeve — do not gut IRA/Roth to spare a taxable ST lot you were not forced to touch. If the only cheap cut is IRA, say so. If the only taxable cut is a fat ST gain, prefer no trade unless #1 forces it. State: **why this ticker, account, and lot vs the next-best.** Then recompute weights, sleeves, cash, tax, $10k.
 
@@ -747,33 +1046,41 @@ A ticker is not one lot (taxable LT ≠ taxable ST ≠ IRA). Compare at least tw
 
 **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
 
-**0. Executive Decision** — Trade / No trade · High/Medium/Low · Reduce/Maintain/Add + Risk-On/Neutral/Off · trades (ticker, account, lot/term, $, horizon, proceeds) or None · trades I will not make · why in 3–5 sentences
+**0. Executive Recommendation** — PROPOSED TRADE / NO ACTION / NEEDS REVIEW · High/Medium/Low confidence · Reduce/Maintain/Add + Risk-On/Neutral/Risk-Off · proposed actions (ticker, account, lot/term, quantity, $, decision trigger, proceeds) or None · proposals declined today · why in 3–5 sentences. State: **Analytical proposal — not an approved or submitted trade.**
 
-**1. Daily Delta + Health** — use the pre-computed delta; 8–12 lines on weights, P/L, ST/LT, sleeves, cash, breaches. No 20-name tape dump.
+**1. Daily Delta + Health** — use the pre-computed portfolio and observed-account deltas; 8–12 lines on weights, quantities/account changes, P/L, ST/LT, sleeves, cash, breaches, and open reviews. No 20-name tape dump. Never infer a trade or intent from a position change alone.
 
 **2. Regime / stress** — only what changes a decision. Directional (no fake VaR): Nasdaq −10%; semi −15%; AI-capex down; rates spike; broad correction without AI damage.
 
-**3. Must-analyze** — every name listed in §1. Do not omit a name because it is under {ANALYZE_WEIGHT_FLOOR:g}%; harvest and material-loss names stay in. Compact table: Action · horizon · last · avg/cost · P/L · term/account · thesis/valuation · target wt · one-line why. Tax-engine + two-sleeve compare only on Trim/Sell. Optional 1–3 new ideas if they pass factor + $10k.
+**3. Decision reconciliation** — compact table: Ticker · Prior Model Proposal · Current Proposal · Continuity (UNCHANGED/MODIFIED/REVERSED/RESOLVED/NOT CAPTURED) · Observed Account Change · Qualifying Delta · Approval State. A prior proposal is not approval. No E*TRADE change means NO EXECUTION DETECTED, not “pending.”
 
-**4. Cash / tax / post-trade** — SGOV plan (now {fmt_money(cash_mv)}). If any trade: min $ vs recommended; estimated ST/LT tax; updated cash, top-5, direct %, broad %, $10k of the trade. Nasdaq beta: up / similar / down. No fake expected-return or drawdown to one decimal.
+**4. Must-analyze** — every name listed in §1. Do not omit a name because it is under {ANALYZE_WEIGHT_FLOOR:g}%; taxable-harvest and material-loss names stay in. Compact table: Ticker · Fundamental View · Portfolio Action · Confidence · Prior Proposal/Status · last · avg/cost · P/L · term/account · target wt · verified evidence · missing information · decision trigger. Apply the tax engine and two-source comparison only to REDUCE or REPLACE.
 
-**5. Zones** — Add / Hold / Trim / Exit on names you touched or near a limit. One line: if X happens, today’s decision is wrong.
+**5. New ideas** — required table with 2–3 tickers not currently held: Rank · Ticker · Portfolio role · Fundamental View · Portfolio Action (DEPLOY/NO ACTION) · Candidate Status (ACTIONABLE/WATCH) · Why now (verified, dated evidence) · Valuation/entry discipline · Principal risk · Comparison with the best two relevant holdings · $10k direct/broad/cash/top-5 impact · decision trigger. Do not force a DEPLOY action when cash, evidence, valuation, or portfolio fit does not clear the trade bar.
+
+**6. Cash / tax / post-trade** — SGOV plan (now {fmt_money(cash_mv)}). If any proposed trade: min $ vs recommended; estimated ST/LT tax; wash-sale status/scope; updated cash, top-5, direct %, broad %, $10k of the trade. Nasdaq beta: up / similar / down. No fake expected-return or drawdown to one decimal.
+
+**7. Decision triggers** — only names touched, under observable review, near a limit, or listed as a new idea. Use the allowed Portfolio Action values; WATCH is a candidate status, not a Portfolio Action. One line each: the specific observable condition that would make today's proposal wrong or require review.
 """
     return prompt.strip() + "\n"
 
 
 def main(argv=None) -> int:
-    parser = ArgumentParser(description="Build a portfolio decision prompt.")
-    parser.add_argument("--allow-partial", action="store_true", help="Generate an unsafe marked prompt when an account fails.")
+    parser = ArgumentParser(description="Build a portfolio decision-support prompt.")
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Generate an unsafe marked prompt when an account fails.",
+    )
     args = parser.parse_args(argv)
     print("Fetching live E*TRADE portfolio...")
-    formatted, grand_total, npos, results, as_of = fetch_portfolio_block(verbose=True, allow_partial=args.allow_partial)
+    formatted, grand_total, npos, results, as_of = fetch_portfolio_block(
+        verbose=True, allow_partial=args.allow_partial
+    )
     save_portfolio_block(formatted, as_of=as_of)
 
     holdings, accounts = consolidate(results, grand_total)
-    prompt = build_prompt(
-        holdings, accounts, grand_total, as_of, formatted, results=results
-    )
+    prompt = build_prompt(holdings, accounts, grand_total, as_of, formatted, results=results)
 
     OUT_DIR.mkdir(exist_ok=True)
     date_str = as_of.strftime("%Y-%m-%d")
@@ -791,7 +1098,9 @@ def main(argv=None) -> int:
     print(f"Total liquid:              ${grand_total:,.0f}")
     print(f"Positions:                 {npos}")
     if clipped:
-        print("Clipboard:                 FULL PROMPT copied — paste into your preferred model for analysis")
+        print(
+            "Clipboard:                 FULL PROMPT copied — paste into your preferred model for analysis"
+        )
     print("=" * 60)
     return 0
 

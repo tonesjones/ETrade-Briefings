@@ -11,7 +11,6 @@ import get_portfolio as portfolio
 from etrade_auth import update_env_tokens
 from portfolio_policy import POLICY, load_policy
 
-
 ET = ZoneInfo("America/New_York")
 
 
@@ -35,9 +34,7 @@ class PortfolioParsingTests(unittest.TestCase):
         )
 
     def test_account_list_normalizes_single_object(self):
-        response = {
-            "AccountListResponse": {"Accounts": {"Account": {"accountIdKey": "x"}}}
-        }
+        response = {"AccountListResponse": {"Accounts": {"Account": {"accountIdKey": "x"}}}}
         self.assertEqual(portfolio.parse_account_list(response), [{"accountIdKey": "x"}])
 
     def test_malformed_portfolio_fails_closed(self):
@@ -46,9 +43,7 @@ class PortfolioParsingTests(unittest.TestCase):
 
     def test_balance_uses_total_account_value(self):
         response = {
-            "BalanceResponse": {
-                "Computed": {"RealTimeValues": {"totalAccountValue": 12345.67}}
-            }
+            "BalanceResponse": {"Computed": {"RealTimeValues": {"totalAccountValue": 12345.67}}}
         }
         self.assertEqual(portfolio.parse_account_balance(response), 12345.67)
 
@@ -69,6 +64,7 @@ class PortfolioParsingTests(unittest.TestCase):
             portfolio.parse_account_balance(
                 {"BalanceResponse": {"Computed": {"accountBalance": 0}}}
             )
+
     @patch("get_portfolio.get_portfolio", side_effect=RuntimeError("expired"))
     @patch("get_portfolio.list_accounts")
     @patch("get_portfolio.get_accounts_api")
@@ -90,9 +86,7 @@ class PortfolioParsingTests(unittest.TestCase):
         }
         with self.assertRaises(portfolio.IncompletePortfolioError):
             portfolio.fetch_portfolio_block(verbose=False)
-        text, *_ = portfolio.fetch_portfolio_block(
-            verbose=False, allow_partial=True
-        )
+        text, *_ = portfolio.fetch_portfolio_block(verbose=False, allow_partial=True)
         self.assertIn("INCOMPLETE DATA", text)
 
 
@@ -181,17 +175,21 @@ class BriefingPolicyTests(unittest.TestCase):
         as_of = datetime(2026, 8, 12, tzinfo=ET)
 
         def flags_for(gain: float) -> str:
-            results = [{
-                "tax_bucket": "taxable",
-                "holdings": [{
-                    "symbol": "ZZZ",
-                    "total_cost": 1000.0,
-                    "price_paid": 10.0,
-                    "total_gain": gain,
-                    "lots": [],
-                    "market_value": 750.0,
-                }],
-            }]
+            results = [
+                {
+                    "tax_bucket": "taxable",
+                    "holdings": [
+                        {
+                            "symbol": "ZZZ",
+                            "total_cost": 1000.0,
+                            "price_paid": 10.0,
+                            "total_gain": gain,
+                            "lots": [],
+                            "market_value": 750.0,
+                        }
+                    ],
+                }
+            ]
             return "\n".join(portfolio.collect_tax_flags(results, as_of))
 
         self.assertNotIn("ZZZ", flags_for(POLICY.harvest_loss_dollars + 1))
@@ -201,18 +199,22 @@ class BriefingPolicyTests(unittest.TestCase):
         as_of = datetime(2026, 8, 12, tzinfo=ET)
 
         def flags_for(gain: float, acquired: datetime) -> str:
-            results = [{
-                "tax_bucket": "taxable",
-                "holdings": [{
-                    "symbol": "ZZZ",
-                    "total_cost": 10_000.0,
-                    "price_paid": 10.0,
-                    "total_gain": gain,
-                    "date_acquired": acquired,
-                    "lots": [],
-                    "market_value": 10_000.0 + gain,
-                }],
-            }]
+            results = [
+                {
+                    "tax_bucket": "taxable",
+                    "holdings": [
+                        {
+                            "symbol": "ZZZ",
+                            "total_cost": 10_000.0,
+                            "price_paid": 10.0,
+                            "total_gain": gain,
+                            "date_acquired": acquired,
+                            "lots": [],
+                            "market_value": 10_000.0 + gain,
+                        }
+                    ],
+                }
+            ]
             return "\n".join(portfolio.collect_tax_flags(results, as_of))
 
         st_acq = datetime(2026, 6, 1, tzinfo=ET)
@@ -243,24 +245,26 @@ class BriefingPolicyTests(unittest.TestCase):
 
     def test_prompt_wires_policy_sleeve_labels_and_thresholds(self):
         as_of = datetime(2026, 8, 12, 16, 0, tzinfo=ET)
-        holdings = [{
-            "symbol": "AMD",
-            "market_value": 100_000.0,
-            "weight": 100.0,
-            "price": 100.0,
-            "alias": None,
-            "quantity": 1000.0,
-            "cost_per_share": 50.0,
-            "price_paid": 50.0,
-            "total_cost": 50_000.0,
-            "total_gain": 50_000.0,
-            "total_gain_pct": 100.0,
-            "lots": [],
-            "tax_buckets": {"taxable"},
-            "taxable_mv": 100_000.0,
-            "ira_mv": 0.0,
-            "roth_mv": 0.0,
-        }]
+        holdings = [
+            {
+                "symbol": "AMD",
+                "market_value": 100_000.0,
+                "weight": 100.0,
+                "price": 100.0,
+                "alias": None,
+                "quantity": 1000.0,
+                "cost_per_share": 50.0,
+                "price_paid": 50.0,
+                "total_cost": 50_000.0,
+                "total_gain": 50_000.0,
+                "total_gain_pct": 100.0,
+                "lots": [],
+                "tax_buckets": {"taxable"},
+                "taxable_mv": 100_000.0,
+                "ira_mv": 0.0,
+                "roth_mv": 0.0,
+            }
+        ]
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch.object(briefing, "BRIEFINGS_DIR", Path(directory)),
@@ -277,7 +281,9 @@ class BriefingPolicyTests(unittest.TestCase):
                     "**Portfolio (live from E*TRADE – should not be pasted)**",
                     results=[],
                 )
-        extras = [s for s in POLICY.sleeves["broad_ai_cycle"] if s not in POLICY.sleeves["direct_ai_semi"]]
+        extras = [
+            s for s in POLICY.sleeves["broad_ai_cycle"] if s not in POLICY.sleeves["direct_ai_semi"]
+        ]
         self.assertIn("Broad AI-cycle liquid (direct + " + " ".join(extras) + ")", prompt)
         self.assertIn("Crypto (" + " ".join(POLICY.sleeves["crypto"]) + ")", prompt)
         self.assertIn("Payments (" + " ".join(POLICY.sleeves["payments"]) + ")", prompt)
@@ -294,22 +300,171 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertNotIn("**Live risk flags:**", prompt)
         self.assertNotIn("9627", prompt)
         self.assertIn("7810", prompt)
+        self.assertIn("portfolio decision-support and risk analyst", prompt)
+        self.assertIn("you have no trading authority", prompt)
+        self.assertIn("Fundamental view ≠ portfolio action", prompt)
+        self.assertIn("Decision reconciliation", prompt)
+        self.assertIn("2–3 securities not currently held", prompt)
+        self.assertIn("**5. New ideas** — required table", prompt)
+        self.assertNotIn("Optional 1–3 new ideas", prompt)
+        self.assertIn("NO EXECUTION DETECTED", prompt)
+        self.assertNotIn("You are the PM", prompt)
+        self.assertNotIn("Trim/Sell", prompt)
+
+    def test_taxable_review_is_not_hidden_by_ira_gain(self):
+        results = [
+            {
+                "label": "Brokerage (…7810)",
+                "tax_bucket": "taxable",
+                "holdings": [
+                    {
+                        "symbol": "ZZZ",
+                        "quantity": 100.0,
+                        "market_value": 6000.0,
+                        "total_gain": -1000.0,
+                    }
+                ],
+            },
+            {
+                "label": "IRA (…6183)",
+                "tax_bucket": "traditional",
+                "holdings": [
+                    {
+                        "symbol": "ZZZ",
+                        "quantity": 100.0,
+                        "market_value": 6000.0,
+                        "total_gain": 3000.0,
+                    }
+                ],
+            },
+        ]
+        reviews = briefing.taxable_harvest_reviews(results)
+        self.assertEqual([row["symbol"] for row in reviews], ["ZZZ"])
+
+        consolidated = [
+            {
+                "symbol": "ZZZ",
+                "market_value": 12_000.0,
+                "weight": 1.0,
+                "total_gain": 2000.0,
+                "total_gain_pct": 20.0,
+                "taxable_mv": 6000.0,
+            }
+        ]
+        rows = briefing.must_analyze_holdings(consolidated, {row["symbol"] for row in reviews})
+        self.assertIn("harvest", rows[0]["analyze_reasons"])
+
+    def test_observed_delta_ignores_price_only_move(self):
+        position = {
+            "account_ref": "abc",
+            "account": "…7810",
+            "symbol": "TE",
+            "quantity": 100.0,
+            "price": 4.33,
+            "lots": [
+                {
+                    "acquired": "2026-06-05",
+                    "quantity": 100.0,
+                    "total_cost": 879.0,
+                    "term_code": 2,
+                }
+            ],
+        }
+        prior = {
+            "date": "2026-08-20",
+            "positions": [position],
+            "reviews": [],
+        }
+        today = {
+            "date": "2026-08-21",
+            "positions": [
+                {
+                    **position,
+                    "price": 4.34,
+                    "lots": [{**position["lots"][0], "term_code": 1}],
+                }
+            ],
+            "reviews": [],
+        }
+        delta = briefing.format_observed_delta(today, prior, "prior.json")
+        self.assertIn("NO EXECUTION DETECTED", delta)
+        self.assertNotIn("QUANTITY_INCREASE", delta)
+        self.assertNotIn("QUANTITY_DECREASE", delta)
+
+    def test_observed_delta_detects_partial_sale(self):
+        prior = {
+            "date": "2026-08-20",
+            "positions": [
+                {
+                    "account_ref": "abc",
+                    "account": "…7810",
+                    "symbol": "TE",
+                    "quantity": 100.0,
+                    "lots": [],
+                }
+            ],
+            "reviews": [],
+        }
+        today = {
+            "date": "2026-08-21",
+            "positions": [
+                {
+                    "account_ref": "abc",
+                    "account": "…7810",
+                    "symbol": "TE",
+                    "quantity": 40.0,
+                    "lots": [],
+                }
+            ],
+            "reviews": [],
+        }
+        delta = briefing.format_observed_delta(today, prior, "prior.json")
+        self.assertIn("QUANTITY_DECREASE", delta)
+        self.assertIn("100 → 40", delta)
+        self.assertIn("execution is not confirmed", delta)
+
+    def test_observation_snapshot_hashes_account_key(self):
+        secret_key = "secret-account-key"
+        snapshot = briefing.observation_snapshot_dict(
+            [
+                {
+                    "label": "Brokerage (…7810)",
+                    "account_id_key": secret_key,
+                    "tax_bucket": "taxable",
+                    "holdings": [
+                        {
+                            "symbol": "TE",
+                            "quantity": 10.0,
+                            "price": 4.0,
+                            "market_value": 40.0,
+                            "lots": [],
+                        }
+                    ],
+                }
+            ],
+            [],
+            [],
+            datetime(2026, 8, 21, tzinfo=ET),
+        )
+        self.assertNotIn(secret_key, json.dumps(snapshot))
+        self.assertEqual(snapshot["positions"][0]["account"], "…7810")
 
     def test_holding_line_still_parses_for_daily_delta(self):
-        line = briefing.holding_line({
-            "symbol": "AMD",
-            "alias": None,
-            "weight": 15.2,
-            "market_value": 180_133,
-            "price": 482.93,
-            "total_gain_pct": 165.0,
-            "taxable_mv": 132_806,
-            "ira_mv": 47_327,
-            "roth_mv": 0.0,
-        }, datetime(2026, 8, 12, tzinfo=ET))
-        snap = briefing.parse_snapshot_from_prompt(
-            "**Consolidated holdings**\n" + line + "\n"
+        line = briefing.holding_line(
+            {
+                "symbol": "AMD",
+                "alias": None,
+                "weight": 15.2,
+                "market_value": 180_133,
+                "price": 482.93,
+                "total_gain_pct": 165.0,
+                "taxable_mv": 132_806,
+                "ira_mv": 47_327,
+                "roth_mv": 0.0,
+            },
+            datetime(2026, 8, 12, tzinfo=ET),
         )
+        snap = briefing.parse_snapshot_from_prompt("**Consolidated holdings**\n" + line + "\n")
         self.assertEqual(snap["holdings"][0]["symbol"], "AMD")
         self.assertAlmostEqual(snap["holdings"][0]["weight"], 15.2)
         self.assertAlmostEqual(snap["holdings"][0]["market_value"], 180_133)
@@ -339,16 +494,18 @@ class BriefingPolicyTests(unittest.TestCase):
                 {
                     "label": "Traditional IRA (…6183)",
                     "tax_bucket": "traditional",
-                    "holdings": [{
-                        "symbol": "AMZN",
-                        "price": 200.0,
-                        "market_value": 2000.0,
-                        "cost_per_share": 180.0,
-                        "total_cost": 1800.0,
-                        "total_gain": 200.0,
-                        "lots": [],
-                        "date_acquired": datetime(2021, 1, 12, tzinfo=ET),
-                    }],
+                    "holdings": [
+                        {
+                            "symbol": "AMZN",
+                            "price": 200.0,
+                            "market_value": 2000.0,
+                            "cost_per_share": 180.0,
+                            "total_cost": 1800.0,
+                            "total_gain": 200.0,
+                            "lots": [],
+                            "date_acquired": datetime(2021, 1, 12, tzinfo=ET),
+                        }
+                    ],
                 },
             ],
             as_of,
@@ -406,28 +563,34 @@ class TaxBucketTests(unittest.TestCase):
 
     def test_individual_named_retirement_stays_taxable(self):
         self.assertEqual(
-            portfolio.tax_bucket_from_account({
-                "accountType": "INDIVIDUAL",
-                "accountName": "Retirement",
-                "accountDesc": "Retirement savings",
-                "accountMode": "CASH",
-            }),
+            portfolio.tax_bucket_from_account(
+                {
+                    "accountType": "INDIVIDUAL",
+                    "accountName": "Retirement",
+                    "accountDesc": "Retirement savings",
+                    "accountMode": "CASH",
+                }
+            ),
             "taxable",
         )
 
     def test_unknown_type_falls_back_to_name(self):
         self.assertEqual(
-            portfolio.tax_bucket_from_account({
-                "accountType": "UNKNOWN",
-                "accountName": "SEP IRA",
-            }),
+            portfolio.tax_bucket_from_account(
+                {
+                    "accountType": "UNKNOWN",
+                    "accountName": "SEP IRA",
+                }
+            ),
             "traditional",
         )
         self.assertEqual(
-            portfolio.tax_bucket_from_account({
-                "accountType": "",
-                "accountName": "Roth leftover",
-            }),
+            portfolio.tax_bucket_from_account(
+                {
+                    "accountType": "",
+                    "accountName": "Roth leftover",
+                }
+            ),
             "roth",
         )
 
