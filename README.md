@@ -59,6 +59,8 @@ The prompt is a **decision-support engine**, not a holdings dump. The model has 
 - Show the **$10k marginal** effect of any buy on direct AI/semi, broad AI-cycle, cash, and top-5
 - On Trim/Sell, **compare at least two account/lot choices** — no fixed IRA-first or taxable-first waterfall
 - Treat **Replace** as sell + a named replacement (cash is Reduce / Deploy, not Replace)
+- Treat a soft concentration breach as **review + no-add**, not an automatic sale: do not reduce an intact holding into idle cash unless de-risking itself clears a hard-risk bar; otherwise require an immediately attractive named deployment or use KEEP / NO ACTION
+- Give every new research idea an explicit **High / Medium / Low conviction**, separate from conviction to deploy at today's valuation
 - Respect **wash-sale** on taxable losses
 - Include a **horizon** on every action and a directional **stress** (Nasdaq −10%, semi −15%, etc.) — no fake VaR
 - Separate **Fundamental View** from **Portfolio Action**

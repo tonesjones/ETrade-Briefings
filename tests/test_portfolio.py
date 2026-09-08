@@ -293,8 +293,7 @@ class BriefingPolicyTests(unittest.TestCase):
             f"Do not omit a name because it is under {POLICY.analyze_weight_floor_pct:g}%",
             prompt,
         )
-        for label, _symbol, _note in POLICY.marginal_examples:
-            self.assertIn(label, prompt)
+        self.assertIn("$10k purchase examples are unavailable", prompt)
         self.assertNotIn("Per-account source block", prompt)
         self.assertNotIn("Portfolio (live from E*TRADE", prompt)
         self.assertNotIn("**Live risk flags:**", prompt)
@@ -306,10 +305,87 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertIn("Decision reconciliation", prompt)
         self.assertIn("2–3 securities not currently held", prompt)
         self.assertIn("**5. New ideas** — required table", prompt)
+        self.assertIn("**Owner deployment preference.**", prompt)
+        self.assertIn("Do not propose **REDUCE**", prompt)
+        self.assertIn("Where does every dollar deploy now?", prompt)
+        self.assertIn("Conviction (High/Medium/Low)", prompt)
+        self.assertIn("prefer KEEP/NO ACTION over selling to idle cash", prompt)
+        self.assertIn("Classification rubric: **KEEP**", prompt)
+        self.assertIn("A usable loss alone does not clear the trade bar", prompt)
+        self.assertIn("Only after a proposed **REDUCE** or **REPLACE**", prompt)
+        self.assertIn("Account funding boundary", prompt)
+        self.assertIn("no durable model-proposal record", prompt)
+        self.assertIn("Owner profile and hard limits", prompt)
+        self.assertIn("next 30-day restriction", prompt)
+        self.assertIn("Static sleeve membership is only a lower-bound", prompt)
+        self.assertIn("**Appendix — monitoring only**", prompt)
         self.assertNotIn("Optional 1–3 new ideas", prompt)
         self.assertIn("NO EXECUTION DETECTED", prompt)
         self.assertNotIn("You are the PM", prompt)
         self.assertNotIn("Trim/Sell", prompt)
+
+    def test_consolidate_hides_gain_pct_when_any_gain_is_unknown(self):
+        results = [
+            {
+                "label": "Brokerage (…7810)",
+                "total_value": 200.0,
+                "tax_bucket": "taxable",
+                "holdings": [
+                    {
+                        "symbol": "ZZZ",
+                        "market_value": 100.0,
+                        "price": 10.0,
+                        "quantity": 10.0,
+                        "total_cost": 80.0,
+                        "total_gain": 20.0,
+                    }
+                ],
+            },
+            {
+                "label": "IRA (…6183)",
+                "total_value": 200.0,
+                "tax_bucket": "traditional",
+                "holdings": [
+                    {
+                        "symbol": "ZZZ",
+                        "market_value": 100.0,
+                        "price": 10.0,
+                        "quantity": 10.0,
+                        "total_cost": 80.0,
+                        "total_gain": None,
+                    }
+                ],
+            },
+        ]
+        holdings, _accounts = briefing.consolidate(results, 400.0)
+        self.assertIsNone(holdings[0]["total_gain"])
+        self.assertIsNone(holdings[0]["total_gain_pct"])
+
+    def test_marginal_10k_reranks_top_five_after_sgov_to_top_five_transfer(self):
+        holdings = [
+            {"symbol": "SGOV", "market_value": 50_000.0},
+            {"symbol": "VOO", "market_value": 40_000.0},
+            {"symbol": "AAA", "market_value": 30_000.0},
+            {"symbol": "BBB", "market_value": 20_000.0},
+            {"symbol": "CCC", "market_value": 15_000.0},
+            {"symbol": "DDD", "market_value": 10_000.0},
+        ]
+        total = sum(h["market_value"] for h in holdings)
+        table = briefing.format_marginal_10k(
+            holdings,
+            total,
+            cluster_mv=0.0,
+            broad_mv=0.0,
+            cash_mv=50_000.0,
+            results=[
+                {
+                    "label": "Brokerage (…7810)",
+                    "holdings": [{"symbol": "SGOV", "market_value": 50_000.0}],
+                }
+            ],
+        )
+        voo_row = next(line for line in table.splitlines() if line.startswith("| VOO |"))
+        self.assertEqual(voo_row.split("|")[5].strip(), "0")
 
     def test_taxable_review_is_not_hidden_by_ira_gain(self):
         results = [
