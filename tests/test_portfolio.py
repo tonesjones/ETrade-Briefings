@@ -240,6 +240,7 @@ class BriefingPolicyTests(unittest.TestCase):
             prompt = (prompts / "daily_briefing_prompt_2026-09-18.md").read_text(encoding="utf-8")
             self.assertIn("3 calendar days earlier", prompt)
             self.assertIn("changes are cumulative", prompt)
+            self.assertLess(len(prompt.split()), 3500)
             self.assertTrue((briefings / "weights_2026-09-18.json").exists())
             self.assertTrue((briefings / "observations_2026-09-18.json").exists())
 
@@ -333,8 +334,157 @@ class BriefingPolicyTests(unittest.TestCase):
                 results=[],
             )
         self.assertIn("**Cash composition:** SGOV $900, CASH $100", prompt)
-        self.assertIn("KEEP requires THESIS SUPPORTED with dated research evidence", prompt)
+        self.assertIn("KEEP** requires dated evidence that the thesis is supported", prompt)
         self.assertIn("NO ACTION / RESEARCH INCOMPLETE", prompt)
+
+    def test_routine_prompt_defers_candidate_refresh_and_stays_compact(self):
+        as_of = datetime(2026, 9, 18, 16, 0, tzinfo=ET)
+        prior_as_of = datetime(2026, 9, 17, 16, 0, tzinfo=ET)
+        holdings = [
+            {
+                "symbol": "SGOV",
+                "market_value": 900.0,
+                "weight": 90.0,
+                "price": 100.0,
+                "alias": None,
+                "quantity": 9.0,
+                "cost_per_share": None,
+                "price_paid": None,
+                "total_cost": None,
+                "total_gain": None,
+                "total_gain_pct": None,
+                "lots": [],
+                "tax_buckets": {"taxable"},
+                "taxable_mv": 900.0,
+                "ira_mv": 0.0,
+                "roth_mv": 0.0,
+            },
+            {
+                "symbol": "CASH",
+                "market_value": 100.0,
+                "weight": 10.0,
+                "price": 1.0,
+                "alias": None,
+                "quantity": 100.0,
+                "cost_per_share": None,
+                "price_paid": None,
+                "total_cost": None,
+                "total_gain": None,
+                "total_gain_pct": None,
+                "lots": [],
+                "tax_buckets": {"taxable"},
+                "taxable_mv": 100.0,
+                "ira_mv": 0.0,
+                "roth_mv": 0.0,
+            },
+        ]
+        prior_weights = briefing.snapshot_dict(
+            holdings,
+            {
+                "grand_total": 1000.0,
+                "cluster_w": 0.0,
+                "broad_w": 0.0,
+                "cash_w": 100.0,
+                "top5_w": 100.0,
+                "breaches": [],
+            },
+            prior_as_of,
+        )
+        prior_observation = briefing.observation_snapshot_dict(
+            [], [], [], prior_as_of
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            briefings = root / "briefings"
+            prompts = root / "prompts"
+            briefings.mkdir()
+            prompts.mkdir()
+            (briefings / "weights_2026-09-17.json").write_text(
+                json.dumps(prior_weights), encoding="utf-8"
+            )
+            (briefings / "observations_2026-09-17.json").write_text(
+                json.dumps(prior_observation), encoding="utf-8"
+            )
+            with (
+                patch.object(briefing, "BRIEFINGS_DIR", briefings),
+                patch.object(briefing, "OUT_DIR", prompts),
+                patch.object(
+                    briefing, "load_portfolio_context", return_value=({}, "_No context._")
+                ),
+            ):
+                prompt = briefing.build_prompt(
+                    holdings,
+                    [{"label": "Brokerage (…7810)", "total": 1000.0, "tax_bucket": "taxable"}],
+                    1000.0,
+                    as_of,
+                    "unused",
+                    results=[],
+                )
+        self.assertIn("**Output mode:** ROUTINE DAY", prompt)
+        self.assertIn("**Candidate refresh:** no", prompt)
+        self.assertIn("Do not generate new tickers today", prompt)
+        self.assertIn("Write 'No candidate change' otherwise", prompt)
+        self.assertIn("Keep a routine-day answer under 1,000 words", prompt)
+        self.assertLess(len(prompt.split()), 3000)
+        self.assertNotIn("Refresh the candidate list.", prompt)
+
+    def test_decision_prompt_refreshes_candidates_after_weight_change(self):
+        as_of = datetime(2026, 9, 18, 16, 0, tzinfo=ET)
+        prior_as_of = datetime(2026, 9, 17, 16, 0, tzinfo=ET)
+        holding = {
+            "symbol": "AMD",
+            "market_value": 100_000.0,
+            "weight": 100.0,
+            "price": 100.0,
+            "alias": None,
+            "quantity": 1000.0,
+            "cost_per_share": 50.0,
+            "price_paid": 50.0,
+            "total_cost": 50_000.0,
+            "total_gain": 50_000.0,
+            "total_gain_pct": 100.0,
+            "lots": [],
+            "tax_buckets": {"taxable"},
+            "taxable_mv": 100_000.0,
+            "ira_mv": 0.0,
+            "roth_mv": 0.0,
+        }
+        prior_weights = briefing.snapshot_dict(
+            [{**holding, "weight": 90.0, "market_value": 90_000.0}],
+            {
+                "grand_total": 100_000.0,
+                "cluster_w": 90.0,
+                "broad_w": 90.0,
+                "cash_w": 10.0,
+                "top5_w": 90.0,
+                "breaches": ["AMD"],
+            },
+            prior_as_of,
+        )
+        policy = briefing.briefing_output_policy(
+            [holding],
+            [],
+            [holding],
+            briefing.snapshot_dict(
+                [holding],
+                {
+                    "grand_total": 100_000.0,
+                    "cluster_w": 100.0,
+                    "broad_w": 100.0,
+                    "cash_w": 0.0,
+                    "top5_w": 100.0,
+                    "breaches": ["AMD"],
+                },
+                as_of,
+            ),
+            prior_weights,
+            {"positions": [], "reviews": []},
+            {"positions": [], "reviews": []},
+            as_of,
+        )
+        self.assertEqual(policy.mode, "DECISION DAY")
+        self.assertTrue(policy.refresh_candidates)
+        self.assertIn("AMD", policy.material_symbols)
 
     def test_harvest_flag_uses_policy_cutoff(self):
         as_of = datetime(2026, 8, 12, tzinfo=ET)
@@ -453,9 +603,9 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertIn("Crypto (" + " ".join(POLICY.sleeves["crypto"]) + ")", prompt)
         self.assertIn("Payments (" + " ".join(POLICY.sleeves["payments"]) + ")", prompt)
         self.assertIn("Broad index (" + " ".join(POLICY.sleeves["broad_index"]) + ")", prompt)
-        self.assertIn(f"work *toward* {POLICY.risk_off_glide_pct:g}%", prompt)
+        self.assertIn(f"work toward {POLICY.risk_off_glide_pct:g}%", prompt)
         self.assertIn(
-            f"Do not omit a name because it is under {POLICY.analyze_weight_floor_pct:g}%",
+            f"Weight ≥ {POLICY.analyze_weight_floor_pct:g}%",
             prompt,
         )
         self.assertIn("$10k purchase examples are unavailable", prompt)
@@ -464,26 +614,21 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertNotIn("**Live risk flags:**", prompt)
         self.assertNotIn("9627", prompt)
         self.assertIn("7810", prompt)
-        self.assertIn("portfolio decision-support and risk analyst", prompt)
-        self.assertIn("you have no trading authority", prompt)
-        self.assertIn("Fundamental view ≠ portfolio action", prompt)
-        self.assertIn("Decision reconciliation", prompt)
-        self.assertIn("2–3 securities not currently held", prompt)
-        self.assertIn("**5. New ideas** — required table", prompt)
-        self.assertIn("**Owner deployment preference.**", prompt)
-        self.assertIn("Do not propose **REDUCE**", prompt)
-        self.assertIn("Where does every dollar deploy now?", prompt)
-        self.assertIn("Conviction (High/Medium/Low)", prompt)
-        self.assertIn("prefer KEEP/NO ACTION over selling to idle cash", prompt)
-        self.assertIn("Classification rubric: **KEEP**", prompt)
+        self.assertIn("portfolio decision-support analyst", prompt)
+        self.assertIn("not an approval, order, execution record", prompt)
+        self.assertIn("View versus action", prompt)
+        self.assertIn("**0. Decision card.**", prompt)
+        self.assertIn("at most two non-held candidates", prompt)
+        self.assertIn("**3. Candidate review.**", prompt)
+        self.assertIn("Do not REDUCE an intact holding merely to create idle cash", prompt)
+        self.assertIn("Name the immediate destination", prompt)
         self.assertIn("A usable loss alone does not clear the trade bar", prompt)
-        self.assertIn("Only after a proposed **REDUCE** or **REPLACE**", prompt)
-        self.assertIn("Account funding boundary", prompt)
+        self.assertIn("**Funding boundary.**", prompt)
         self.assertIn("Decision history table as the only durable proposal record", prompt)
         self.assertIn("Owner profile and hard limits", prompt)
         self.assertIn("next 30-day restriction", prompt)
-        self.assertIn("Static sleeve membership is only a lower-bound", prompt)
-        self.assertIn("**Appendix — monitoring only**", prompt)
+        self.assertIn("Sleeve labels are lower bounds and omit look-through", prompt)
+        self.assertNotIn("**Appendix — monitoring only**", prompt)
         self.assertNotIn("Optional 1–3 new ideas", prompt)
         self.assertIn("NO EXECUTION DETECTED", prompt)
         self.assertNotIn("You are the PM", prompt)

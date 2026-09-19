@@ -45,6 +45,14 @@ class BriefingBuildResult:
     weights_snapshot: dict
     observation_snapshot: dict
 
+
+@dataclass(frozen=True)
+class BriefingOutputPolicy:
+    mode: str
+    material_symbols: tuple[str, ...]
+    refresh_candidates: bool
+    include_tax_detail: bool
+
 # User-editable decision policy (portfolio_policy.json).
 AI_SEMI_CLUSTER = POLICY.sleeves["direct_ai_semi"]
 BROAD_AI_LIQUID = POLICY.sleeves["broad_ai_cycle"]
@@ -438,6 +446,123 @@ def format_must_analyze(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _position_key(row: dict) -> tuple[str, str]:
+    return str(row.get("account_ref") or ""), str(row.get("symbol") or "")
+
+
+def _lot_identity(row: dict) -> list[tuple]:
+    return [
+        (
+            lot.get("acquired"),
+            round(float(lot.get("quantity") or 0.0), 8),
+            round(float(lot.get("total_cost") or 0.0), 2),
+        )
+        for lot in row.get("lots") or []
+    ]
+
+
+def _changed_weight_symbols(today_snap: dict, prior_snap: dict | None) -> set[str]:
+    if not prior_snap:
+        return set()
+    previous = {row["symbol"]: row for row in prior_snap.get("holdings") or []}
+    current = {row["symbol"]: row for row in today_snap.get("holdings") or []}
+    changed = set()
+    for symbol in set(previous) | set(current):
+        if is_cash_symbol(symbol):
+            continue
+        old = previous.get(symbol)
+        new = current.get(symbol)
+        if old is None or new is None:
+            changed.add(symbol)
+            continue
+        if abs((new.get("weight") or 0.0) - (old.get("weight") or 0.0)) >= 0.5:
+            changed.add(symbol)
+    return changed
+
+
+def _changed_observation_symbols(today: dict, prior: dict | None) -> set[str]:
+    if not prior:
+        return set()
+    previous = {_position_key(row): row for row in prior.get("positions") or []}
+    current = {_position_key(row): row for row in today.get("positions") or []}
+    changed = set()
+    for key in set(previous) | set(current):
+        old = previous.get(key)
+        new = current.get(key)
+        row = new or old or {}
+        symbol = row.get("symbol") or ""
+        if not symbol or is_cash_symbol(symbol):
+            continue
+        if old is None or new is None:
+            changed.add(symbol)
+            continue
+        old_qty = float(old.get("quantity") or 0.0)
+        new_qty = float(new.get("quantity") or 0.0)
+        tolerance = max(1e-6, abs(old_qty) * 1e-8)
+        if abs(new_qty - old_qty) > tolerance or _lot_identity(old) != _lot_identity(new):
+            changed.add(symbol)
+    previous_reviews = {
+        (row.get("kind"), row.get("symbol"), row.get("account"))
+        for row in prior.get("reviews") or []
+    }
+    current_reviews = {
+        (row.get("kind"), row.get("symbol"), row.get("account"))
+        for row in today.get("reviews") or []
+    }
+    changed.update(row[1] for row in previous_reviews ^ current_reviews if row[1])
+    return changed
+
+
+def briefing_output_policy(
+    holdings: list[dict],
+    harvest_reviews: list[dict],
+    breaches: list[dict],
+    today_snap: dict,
+    prior_snap: dict | None,
+    today_observation: dict,
+    prior_observation: dict | None,
+    as_of: datetime,
+) -> BriefingOutputPolicy:
+    """Choose compact daily output or expanded decision-day output."""
+    weight_changes = _changed_weight_symbols(today_snap, prior_snap)
+    observation_changes = _changed_observation_symbols(today_observation, prior_observation)
+
+    first_run = prior_snap is None and prior_observation is None
+    decision_day = first_run or bool(weight_changes or observation_changes)
+    if prior_snap:
+        prior_breaches = set(prior_snap.get("breaches") or [])
+        current_breaches = {row["symbol"] for row in breaches}
+        decision_day = decision_day or prior_breaches != current_breaches
+
+    previous_date = None
+    if prior_snap:
+        raw_date = prior_snap.get("date") or prior_snap.get("as_of")
+        if raw_date:
+            try:
+                previous_date = datetime.fromisoformat(str(raw_date)).date()
+            except ValueError:
+                previous_date = None
+    gap = (as_of.date() - previous_date).days if previous_date else None
+    refresh_candidates = first_run or (gap is not None and gap >= 7) or decision_day
+    include_tax_detail = bool(harvest_reviews) and decision_day
+    required = must_analyze_holdings(
+        holdings, {row["symbol"] for row in harvest_reviews}
+    )
+    material = (
+        {row["symbol"] for row in required}
+        if decision_day
+        else {row["symbol"] for row in harvest_reviews}
+    )
+    material.update(weight_changes | observation_changes)
+    material.update(row["symbol"] for row in breaches)
+    return BriefingOutputPolicy(
+        mode="DECISION DAY" if decision_day else "ROUTINE DAY",
+        material_symbols=tuple(sorted(material)),
+        refresh_candidates=refresh_candidates,
+        include_tax_detail=include_tax_detail,
+    )
+
+
 def min_cut_to_cap(mv: float, total: float, cap_pct: float) -> float:
     if total <= 0:
         return 0.0
@@ -592,21 +717,6 @@ def load_prior_observation(as_of: datetime) -> tuple[dict | None, str]:
         except (OSError, json.JSONDecodeError):
             continue
     return None, ""
-
-
-def _position_key(row: dict) -> tuple[str, str]:
-    return str(row.get("account_ref") or ""), str(row.get("symbol") or "")
-
-
-def _lot_identity(row: dict) -> list[tuple]:
-    return [
-        (
-            lot.get("acquired"),
-            round(float(lot.get("quantity") or 0.0), 8),
-            round(float(lot.get("total_cost") or 0.0), 2),
-        )
-        for lot in row.get("lots") or []
-    ]
 
 
 def format_observed_delta(today: dict, prior: dict | None, prior_label: str) -> str:
@@ -1103,7 +1213,9 @@ def build_briefing(
         account_bits.append(f"  - {shown}{loc_note}: ≈ {fmt_money(a['total'])}{cash_note}")
     account_lines = "\n".join(account_bits) if account_bits else "  - _No funded accounts._"
 
-    holdings_lines = "\n".join(holding_line(h, as_of) for h in holdings if h["market_value"] >= 50)
+    holdings_lines = "\n".join(
+        holding_line(h, as_of) for h in holdings if h["market_value"] >= 50
+    )
     harvest_reviews = taxable_harvest_reviews(results)
     harvest_symbols = {row["symbol"] for row in harvest_reviews}
     analyze_rows = must_analyze_holdings(holdings, harvest_symbols)
@@ -1148,6 +1260,16 @@ def build_briefing(
     observed_delta = format_observed_delta(
         today_observation, prior_observation, prior_observation_label
     )
+    output_policy = briefing_output_policy(
+        holdings,
+        harvest_reviews,
+        breaches,
+        today_snap,
+        prior_snap,
+        today_observation,
+        prior_observation,
+        as_of,
+    )
     snapshot_coverage = _snapshot_coverage(as_of, prior_snap, prior_label)
     constraint_math = format_constraint_math(holdings, grand_total, cluster_mv)
     marginal_10k = format_marginal_10k(
@@ -1156,14 +1278,43 @@ def build_briefing(
     owner_profile = format_owner_profile(context)
     research_records = format_research_records(context)
     decision_history = format_decision_history(context)
+    focus_symbols = ", ".join(output_policy.material_symbols) or "none"
+    tax_detail = (
+        f"{tax_table}{tax_flag_block}"
+        if output_policy.include_tax_detail
+        else "_Exact lots remain in the source data. Do not propose a tax-sensitive action without naming the account and lot._"
+    )
+    marginal_detail = (
+        marginal_10k
+        if output_policy.refresh_candidates
+        else "_Recalculate the $10k example only if proposing DEPLOY or REPLACE._"
+    )
+    if output_policy.refresh_candidates:
+        candidate_instruction = (
+            "Refresh the candidate list. Include at most two non-held candidates. "
+            "Use NO ACTION / WATCH unless the trade bar is met."
+        )
+        candidate_output = (
+            "Include at most two non-held candidates. For each, give role, dated evidence, "
+            "entry condition, principal risk, and why it improves the portfolio."
+        )
+    else:
+        candidate_instruction = (
+            "Do not generate new tickers today. Recheck the existing candidates in the "
+            "supplied research context and report only a changed trigger or thesis."
+        )
+        candidate_output = (
+            "Report existing candidates only when their trigger or thesis changed. "
+            "Write 'No candidate change' otherwise."
+        )
 
-    prompt = f"""You are a portfolio decision-support and risk analyst assisting the account owner. Analyze the whole portfolio rather than screening stocks independently.
+    prompt = f"""You are a portfolio decision-support analyst. Analyze the whole portfolio.
 
-You may recommend actions, but you have no trading authority. Recommendations are proposals for human review — not instructions, approvals, open orders, or evidence that a trade will be executed.
+This is an analytical proposal for human review. It is not an approval, order, execution record, or instruction to trade. Use only supplied values and dated sources. Never invent a price, lot, tax result, approval state, or execution. If a material fact is missing, use **NO ACTION / NEEDS REVIEW**.
 
-Allowed **Portfolio Action** values are exactly: **KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION**. A proposed sale names **this ticker, this account, this lot or lot group, this quantity, and this dollar amount**. Use the supplied As-of marks. Never invent prices, costs, dates, quantities, tax treatment, execution status, or ST/LT classification.
+Allowed Portfolio Action values are **KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION**. A proposed sale must name the ticker, account, lot, quantity, dollars, proceeds destination, and decision trigger.
 
-Separate verified facts, supplied calculations, assumptions, analytical judgment, and missing information. When required information is missing or conflicting, use **NO ACTION / NEEDS REVIEW** rather than manufacturing conviction.
+**Output mode:** {output_policy.mode}. **Decision focus:** {focus_symbols}. **Candidate refresh:** {"yes" if output_policy.refresh_candidates else "no"}.
 
 Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
 
@@ -1183,13 +1334,10 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 **Observed account delta** (E*TRADE position evidence only):
 {observed_delta}
 
-**Observable review state** (generated from E*TRADE; reviews, not orders):
+**Observable review state** (generated from E*TRADE; evidence, not orders):
 {observable_review_block}
 
-- **OPEN_TLH_REVIEW** means a qualifying taxable loss remains present. It does not mean a sale was recommended or approved.
-- **CONCENTRATION_REVIEW** means a supplied soft limit is exceeded. It does not mean a sale was approved.
-- **POSITION/QUANTITY/LOT changes** describe observable account changes only. Without transaction or order evidence, they do not prove a trade, motive, or approval.
-- **NO EXECUTION DETECTED** does not establish whether any prior proposal was approved, rejected, or deferred.
+Review flags and position changes do not establish intent, approval, rejection, or execution.
 
 **Factor sleeves (do not invent %):**
 - Direct AI/semi ({direct_members}): **{fmt_weight(cluster_w)}** / {fmt_money(cluster_mv)} — {cluster_status}
@@ -1201,13 +1349,13 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 **Constraint math (use these dollars):**
 {constraint_math}
 
-**Marginal $10k from SGOV (apply this unit to every proposed trade):**
-{marginal_10k}
+**Marginal $10k from SGOV:**
+{marginal_detail}
 
 **Accounts:**
 {account_lines}
 
-**Account funding boundary.** Account totals do not establish usable buying power. Cash or SGOV in one account cannot fund a purchase in another without a verified transfer, settlement, and tax-aware implementation path. Treat buying power as account-specific: every DEPLOY or REPLACE names the funding account, source security/cash, settled amount, and purchasing account. Do not add cash across accounts to make a proposal appear funded.
+**Funding boundary.** Account totals are not buying power. Every DEPLOY or REPLACE must name the funding account, settled source cash or security, amount, and purchasing account. Never combine cash across accounts.
 
 **Owner profile** (user-maintained; never infer blanks):
 {owner_profile}
@@ -1219,11 +1367,11 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 **Decision history** (analytical proposals, not trade authority):
 {decision_history}
 
-**Consolidated holdings:**
+**Portfolio holdings.** Use this source table for weights and calculations. Do not repeat the full table in the answer.
 
 {holdings_lines}
 
-**Must-analyze (do not skip):**
+**Decision focus.** Start with these names. Include another name only when new evidence or an account change makes it material.
 {must_analyze_block}
 
 **Lots** (source of truth). Avg = cost/share. Cost = dollars in. P/L = unrealized. Taxable ST = held ≤ 1 year; LT = held > 1 year. IRA/Roth = economic P/L only — not a CG event. Same ticker in two accounts = two decision buckets.
@@ -1234,71 +1382,67 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 
 # 2. Rules
 
-**Limits.** Single-name soft max **{SINGLE_NAME_CAP:g}%**. Use the pre-computed min $ — do not sell a {SINGLE_NAME_CAP:g}% slice of a name because it is slightly over. Direct AI/semi: do not add at ≥ {CLUSTER_NO_ADD:g}% (now {fmt_weight(cluster_w)}). Soft ceiling **{CLUSTER_SOFT_CAP:g}%**; a breach creates a review and no-add condition, not an automatic sale. Holding above the soft ceiling is allowed when cutting is punitive ST or when no immediately attractive named deployment beats continuing to hold the working thesis — never raise the ceiling. Risk-Off: work *toward* {RISK_OFF_GLIDE:g}% via tax-aware lots only.
+**Limits.** Single-name soft max is **{SINGLE_NAME_CAP:g}%**. Direct AI/semi is no-add at **{CLUSTER_NO_ADD:g}%** and has a soft ceiling of **{CLUSTER_SOFT_CAP:g}%**. A soft breach creates review and no-add, not an automatic sale. Use the pre-computed minimum cut. Risk-Off means work toward {RISK_OFF_GLIDE:g}% with tax-aware lots.
 
-**Authority and state.** E*TRADE establishes observed holdings and executions; it does not establish intent. A prior model recommendation, when supplied, is historical analytical context — never an approval or order. Never infer **USER APPROVED** from model text or **NO EXECUTION DETECTED** from approval status.
+**Authority.** E*TRADE data establishes observed positions and observable changes. It does not establish intent or approval. A prior model proposal is historical context. **NO EXECUTION DETECTED** is not approval, rejection, or deferral.
 
 **Decision continuity.** This is a continuing portfolio review, not a fresh stock screen. Use the supplied Decision history table as the only durable proposal record. For every prior model proposal there, classify today's proposal as **UNCHANGED / MODIFIED / REVERSED / RESOLVED**. Otherwise say **NOT CAPTURED**; do not reconstruct it from position data, account changes, or snapshots.
 
 A MODIFIED or REVERSED proposal requires at least one qualifying delta: material company-specific evidence; earnings/guidance/regulatory/competitive change; price or valuation movement material to the original thesis; portfolio-weight/factor/liquidity/tax change; observed execution; or a specific error in the prior analysis. State the prior proposal, new proposal, dated new fact, invalidated assumption, and why the change is sufficient. “Reassessment,” “updated outlook,” “fresh analysis,” and “greater upside” are not sufficient.
 
-**Fundamental view ≠ portfolio action.** Report both independently. Fundamental View is **ATTRACTIVE / NEUTRAL / UNATTRACTIVE / INSUFFICIENT EVIDENCE**. Portfolio Action uses only **KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION**. Also state Decision Basis: **THESIS SUPPORTED / ENTRY UNATTRACTIVE / RESEARCH INCOMPLETE / IMPLEMENTATION BLOCKED / TRADE BAR MET**. **KEEP requires THESIS SUPPORTED with dated research evidence.** When research is missing or stale, use **NO ACTION / RESEARCH INCOMPLETE**, name the missing metric or source checked, and do not imply the thesis was reconfirmed.
+**View versus action.** Report Fundamental View as **ATTRACTIVE / NEUTRAL / UNATTRACTIVE / INSUFFICIENT EVIDENCE**. Report Portfolio Action separately. **KEEP** requires dated evidence that the thesis is supported. Missing or stale research means **NO ACTION / RESEARCH INCOMPLETE**.
 
 **Owner profile and hard limits.** Use only supplied profile fields. Treat omitted fields as **UNKNOWN**. Do not infer a risk budget from the current holdings; when a missing item could change an action, use **NO ACTION / NEEDS REVIEW** and identify it.
 
-**Tax.** No ST/LT capital-gains tax on Traditional IRA / Roth. A taxable loss creates a review candidate, not an automatic sale. Wash-sale status must be **CLEAR / POSSIBLE / UNKNOWN** and must state the information scope checked. If relevant accounts, spouse activity, automatic purchases, options, open orders, or the surrounding 61-day transaction window are unavailable, do not claim the loss is usable; say **NEEDS TAX REVIEW**. A backward-looking **CLEAR** status never authorizes the trade or a replacement purchase: before a taxable-loss sale, also state the next 30-day restriction on substantially identical purchases, reinvestments, options, and all relevant accounts.
+**Tax.** IRA and Roth gains are economic P/L, not capital gains. A taxable loss is a review, not a sale. Wash-sale status is **CLEAR / POSSIBLE / UNKNOWN** and must name the scope checked. Missing spouse, automatic-purchase, options, open-order, or 61-day data means **NEEDS TAX REVIEW**. Before a taxable-loss sale, state the next 30-day restriction. A backward-looking CLEAR status does not authorize a sale or replacement.
 
 **Hierarchy.** (1) hard concentration / drawdown that makes de-risking valuable even in cash (2) do not tidy a working thesis for a soft breach without a superior deployment (3) risk-adjusted return after the destination is included (4) tax/friction (5) deploy cash only if return beats liquidity. A hard #1 can require REDUCE to cash; a soft threshold alone cannot. #4 beats incremental #3.
 
-**Trade bar.** Prefer **NO ACTION** when benefit does not clearly exceed tax/friction or evidence is incomplete. Evaluate each action type separately: **DEPLOY** requires available buying power, a supported valuation/portfolio-fit case, and a better risk-adjusted use than holding SGOV; **REPLACE** requires a simultaneous named sale and superior named purchase; **REDUCE** requires a hard risk, thesis break, unacceptable downside/factor drawdown, or valuation so poor that expected return no longer pays for risk and tax. For a working thesis above only a soft concentration threshold, judge the complete sell-and-deploy decision: idle cash is not a portfolio benefit unless de-risking itself clears the hard-risk bar. KEEP and NO ACTION can be high-conviction calls. Do not manufacture trades.
+**Trade bar.** Prefer **NO ACTION** when evidence, valuation, tax, or implementation is incomplete. **DEPLOY** requires account-specific funding, supported valuation, portfolio fit, and a better use than holding SGOV. **REPLACE** requires a named sale and superior named purchase. **REDUCE** requires hard risk, a broken thesis, unacceptable downside, or valuation that no longer pays for risk and tax. A soft concentration breach alone is not enough.
 
-**Owner deployment preference.** Do not propose **REDUCE** of a fundamentally attractive or intact holding merely to create cash, SGOV, or settlement-fund proceeds. First identify a simultaneous, named deployment that is immediately and exceptionally attractive after valuation, risk, tax, friction, and opportunity cost. If no such destination exists, prefer **KEEP** or **NO ACTION**, keep the breach visible, prohibit additions to the crowded sleeve, and provide observable replacement-entry triggers. REDUCE to cash remains allowed only when a hard risk, drawdown, liquidity, or thesis-break case makes holding cash better than continuing to hold the security; state that case explicitly. Never describe temporary cash awaiting an undecided future investment as a completed concentration solution. Classification rubric: **KEEP** = thesis intact and no superior immediate deployment; **NO ACTION** = evidence, pricing, tax, or replacement facts are incomplete; **REDUCE** = cash itself is the deliberate superior risk destination; **REPLACE** = simultaneous named sale and superior buy.
+**Deployment preference.** Do not REDUCE an intact holding merely to create idle cash. Name the immediate destination or state the hard-risk reason cash is better. Use **KEEP** when the thesis is supported and no better deployment exists. Use **NO ACTION** when evidence or implementation is incomplete.
 
 Evaluate the risk of continuing to hold as explicitly as the risk of trading. Owner preferences constrain recommendations; they are not evidence that a holding is attractive. If a preference limits risk reduction, explain the consequence.
 
-**Sizing.** Only after a proposed **REDUCE** or **REPLACE** independently clears the trade bar: use the pre-computed min $, compare a larger cut, and pick the smallest amount that actually fixes the stated problem. A breach alone does not justify a sale. Do not sell more because it is profitable. {SINGLE_NAME_CAP:g}% is a ceiling, not a target. High-vol names get a tighter cap. Conviction uses remaining budget after caps.
+**Sizing.** Size only after REDUCE or REPLACE clears the trade bar. Use the pre-computed minimum that fixes the stated problem. A breach or profit alone does not justify a sale.
 
-**Factor.** Every buy shows Δ direct / Δ broad / Δ cash / Δ top-5 from the $10k table. Broad members ({broad_members}) share the AI-capex tape — ticker diversity ≠ factor diversity. Static sleeve membership is only a lower-bound classification: it omits ETF/index look-through, supply-chain and revenue exposure, and correlated businesses. A ticker absent from a sleeve is not automatically a diversifier; explain its economic correlation with evidence. Buy: why this $10k vs the best 2 names already held. Sale: why this reducer rather than another.
+**Factor.** Ticker diversity is not factor diversity. Broad members ({broad_members}) share the AI-capex cycle. Sleeve labels are lower bounds and omit look-through. Explain why a candidate improves the portfolio and compare it with the best relevant holding.
 
-**REPLACE** = named sale + named buy; moving to cash is REDUCE and later investing cash is DEPLOY. State risk removed, risk added, tax, wash-sale status/scope, and why expected risk/reward is better. For every proposed concentration sale, answer **“Where does every dollar deploy now?”** with destination account, security, dollar allocation, entry evidence, and conviction. If the answer is idle cash, explain the hard-risk reason cash is preferable; otherwise do not propose the sale.
+**REPLACE** names the sale and buy. Moving to cash is REDUCE; investing later is DEPLOY. State risk removed, risk added, tax status, and why the change beats holding.
 
 **Thesis vs price.** Score thesis · valuation · trend · catalyst separately. Price is a trigger, not a thesis — classify moves as market / factor / company / execution / noise. Use a decision trigger, not a vague standalone “hold 6–12 months” horizon.
 
-**Decision quality.** For every actionable proposal, show the chain **dated evidence → change in business expectations or portfolio risk → valuation at the stated price → advantage over holding unchanged and the best feasible alternative → account-specific implementation**. State what must be true, the strongest evidence against the proposal, and the observable invalidation trigger. Use the same scrutiny for KEEP as for trading. Preserve financial reporting period, metric definition, and source URL or filing reference. Do not manufacture valuation ranges, probabilities, expected returns, or precision when inputs are inadequate. Evaluate whether reasonable changes in key assumptions reverse the recommendation; if so, label it **FRAGILE** and identify the missing evidence.
+**Decision quality.** For an actionable proposal, show dated evidence, the changed risk or expectation, valuation, advantage over holding, best alternative, account-specific implementation, strongest counterargument, and invalidation trigger. Keep reporting period, publication date, quote time, and snapshot time separate. Label fragile conclusions. Do not invent precision.
 
-**TLH proposal requirements.** REDUCE or REPLACE for TLH must state: exact taxable account and lot/lot group; quantity and expected realized loss; wash-sale status and scope; named replacement or explicit cash destination; exposure preserved or intentionally changed; and why expected after-tax benefit exceeds spread, complexity, and opportunity cost. A usable loss alone does not clear the trade bar. Apply the owner deployment preference: require an immediately attractive replacement unless a hard-risk case independently makes cash the superior destination. Fundamental weakness is not required, but the portfolio case must stand on its own.
+**Tax-loss proposals.** A REDUCE or REPLACE proposal for tax loss must name the taxable account, lot, quantity, expected loss, wash-sale scope, replacement or cash destination, and why the after-tax benefit beats friction and opportunity cost. A usable loss alone does not clear the trade bar.
 
 **Evidence.** Any company-specific fact that initiates, modifies, or reverses an action needs a source and event/publication date. Prefer filings, earnings releases, transcripts, and regulator/company sources. Label unsourced claims and forecasts as assumptions. If current evidence cannot be verified, use INSUFFICIENT EVIDENCE and do not reverse a prior proposal on that basis.
 
 Keep the portfolio snapshot time, quote/session time, financial reporting period, and news publication/event date distinct. Label stale, mixed-session, or unreconciled inputs. A daily headline is not material unless it changes valuation, thesis, risk budget, deployability, or a decision trigger.
 
-**New ideas.** Include **2–3 securities not currently held** as research candidates in every briefing. Favor ideas that improve diversification and do not raise direct AI/semi exposure. For each: give a **Conviction level of High / Medium / Low**, the portfolio role, current sourced thesis and catalyst, principal risk, valuation/entry discipline, an observable decision trigger, and the supplied $10k factor/cash/top-5 impact. For the strongest candidate, explain what expectations are embedded in the current valuation, what differs from those expectations, why acting now beats waiting, and the evidence period/metric definition. Compare it with the best two relevant names already held and with the other new candidates; if no relevant holding exists, say so. A research candidate is not automatically a trade: assign Portfolio Action **DEPLOY** only when cash/proceeds are available and the idea clears the trade bar; otherwise assign **NO ACTION**, mark Candidate Status **WATCH**, and state what would make it deployable. Distinguish research conviction from conviction to deploy at today's valuation. Do not invent live prices or valuation facts that cannot be verified.
+**Candidates.** {candidate_instruction} Research conviction is separate from conviction to deploy. Do not invent live prices or valuation facts.
 
-# 3. Tax engine (REDUCE/REPLACE only)
+# 3. Tax detail
 
-A ticker is not one lot (taxable LT ≠ taxable ST ≠ IRA). Compare at least two sleeves. Pick account/lot on: risk removed · tax · thesis of what you sell · leftover factor · ST→LT optionality. Tax-free ≠ correct sleeve — do not gut IRA/Roth to spare a taxable ST lot you were not forced to touch. If the only cheap cut is IRA, say so. If the only taxable cut is a fat ST gain, prefer no trade unless #1 forces it. State: **why this ticker, account, and lot vs the next-best.** Then recompute weights, sleeves, cash, tax, $10k.
+{tax_detail}
 
-# 4. Output (this order, short)
+# 4. Output, in this order
 
 **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
 
-**0. Executive Recommendation** — PROPOSED TRADE / NO ACTION / NEEDS REVIEW · High/Medium/Low confidence · Reduce/Maintain/Add + Risk-On/Neutral/Risk-Off · proposed actions (ticker, account, lot/term, quantity, $, decision trigger, proceeds and immediate deployment) or None · proposals declined today · why in 3–5 sentences. If concentration is above a soft threshold but no replacement clears the deployment bar, explicitly prefer KEEP/NO ACTION over selling to idle cash. State: **Analytical proposal — not an approved or submitted trade.**
+**0. Decision card.** State the overall action, what changed, the largest unresolved risk, the best opportunity if any, and the blocker preventing action. Use no more than five sentences. Include **Analytical proposal — not an approved or submitted trade.**
 
-**1. Daily Delta + Health** — use the pre-computed portfolio and observed-account deltas; 8–12 lines on weights, quantities/account changes, P/L, ST/LT, sleeves, cash, breaches, and open reviews. Report at most three material developments; unchanged coverage belongs in the compact appendix. No 20-name tape dump. Never infer a trade or intent from a position change alone.
+**1. Material changes.** Report at most three changes from the prior snapshot or observation. Include weight, quantity, account, lot, sleeve, cash, or review changes only when material. Say **No material change** when none exists. Never infer a trade or intent from a position change alone.
 
-**2. Regime / stress** — only what changes a decision. Directional (no fake VaR): Nasdaq −10%; semi −15%; AI-capex down; rates spike; broad correction without AI damage.
+**2. Risk and action table.** Cover only the Decision focus names. Use columns **Ticker, Fundamental View, Portfolio Action, Reason, Evidence, Missing fact, Trigger**. Add exact lot and account details only for REDUCE or REPLACE.
 
-**3. Decision reconciliation** — compact table: Ticker · Prior Model Proposal · Current Proposal · Continuity (UNCHANGED/MODIFIED/REVERSED/RESOLVED/NOT CAPTURED) · Observed Account Change · Qualifying Delta · Approval State. Reconcile against the supplied Decision history, not memory or inferred broker state. A prior proposal is not approval. No E*TRADE change means NO EXECUTION DETECTED, not “pending.”
+**3. Candidate review.** {candidate_output}
 
-**4. Must-analyze** — every name listed in §1. Do not omit a name because it is under {ANALYZE_WEIGHT_FLOOR:g}%; taxable-harvest and material-loss names stay in. Compact table: Ticker · Fundamental View · Portfolio Action · Decision Basis · Confidence · Prior Proposal/Status · last · avg/cost · P/L · term/account · target wt · verified evidence · missing information · decision trigger. Apply the tax engine and two-source comparison only to REDUCE or REPLACE.
+**4. Implementation.** Include funding account, settled source, purchasing account, exact lots, quantity, tax, wash-sale scope, proceeds destination, and post-trade weights only when proposing REDUCE, REPLACE, or DEPLOY. Otherwise write **No implementation proposed**.
 
-**5. New ideas** — required table with 2–3 tickers not currently held: Rank · Ticker · Conviction (High/Medium/Low) · Portfolio role · Fundamental View · Portfolio Action (DEPLOY/NO ACTION) · Candidate Status (ACTIONABLE/WATCH) · Why now (verified, dated evidence) · Valuation/entry discipline · Principal risk · Comparison with the best two relevant holdings · $10k direct/broad/cash/top-5 impact · decision trigger. Do not force a DEPLOY action when cash, evidence, valuation, or portfolio fit does not clear the trade bar.
+**5. Decision triggers.** List only triggers for the Decision focus names or candidate names. Use one line per trigger.
 
-**6. Cash / tax / post-trade** — Cash-equivalent plan (now {fmt_money(cash_mv)}; composition above). If any proposed trade: min $ vs recommended; estimated ST/LT tax; wash-sale status/scope; updated cash, top-5, direct %, broad %, $10k of the trade; and a dollar-for-dollar proceeds deployment table. Re-rank top-five membership after the proposed trade and identify the actual funding and purchasing accounts. A concentration sale may leave proceeds idle only when the hard-risk case for cash is explicit. Nasdaq beta: up / similar / down. No fake expected-return or drawdown to one decimal.
-
-**7. Decision triggers** — only names touched, under observable review, near a limit, or listed as a new idea. Use the allowed Portfolio Action values; WATCH is a candidate status, not a Portfolio Action. One line each: the specific observable condition that would make today's proposal wrong or require review.
-
-**Appendix — monitoring only** — one short line per unchanged must-analyze holding or candidate: Ticker · **NO MATERIAL UPDATE** · next observable trigger. Do not repeat the executive recommendation, health section, or full position tables here.
+Do not repeat the full holdings table, unchanged names, or the safety rules. Keep a routine-day answer under 1,000 words. Expand only when an action, tax review, account change, or material new evidence requires it.
 """
     return BriefingBuildResult(
         prompt=prompt.strip() + "\n",
