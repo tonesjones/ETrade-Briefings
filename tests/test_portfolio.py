@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,22 @@ class PortfolioParsingTests(unittest.TestCase):
     def test_legacy_human_dump_fails_closed(self):
         with self.assertRaisesRegex(portfolio.PortfolioDataError, "structured payload"):
             portfolio.parse_portable_portfolio_text("**Portfolio (live from E*TRADE)**")
+
+    @patch.object(portfolio.subprocess, "run")
+    def test_clipboard_reader_decodes_windows_code_page_text(self, run):
+        payload = (
+            f"{portfolio.PORTABLE_BEGIN}\n"
+            '{"observed_at":"2026-09-19T00:43:00-04:00","label":"…7810"}\n'
+            f"{portfolio.PORTABLE_END}\n"
+        )
+        run.return_value = SimpleNamespace(stdout=payload.encode("cp1252"))
+        self.assertEqual(portfolio.read_clipboard_text(), payload)
+
+    @patch.object(portfolio.subprocess, "run")
+    def test_clipboard_reader_rejects_missing_output(self, run):
+        run.return_value = SimpleNamespace(stdout=None)
+        with self.assertRaisesRegex(portfolio.PortfolioDataError, "clipboard"):
+            portfolio.read_clipboard_text()
 
     def test_portable_payload_hashes_raw_account_key(self):
         raw_key = "raw-secret-account-key"

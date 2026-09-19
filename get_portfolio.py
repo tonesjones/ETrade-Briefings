@@ -20,6 +20,7 @@ No preview, place, cancel, or change-order calls exist in this repo.
 from __future__ import annotations
 
 import json
+import locale
 import logging
 import os
 import subprocess
@@ -249,10 +250,23 @@ def read_clipboard_text() -> str:
         ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"],
         check=True,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
     )
-    return completed.stdout
+    raw = completed.stdout
+    if not raw:
+        raise PortfolioDataError("clipboard returned no text")
+    if isinstance(raw, str):
+        return raw
+
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+
+    encodings = ["utf-8-sig", "utf-8", locale.getpreferredencoding(False), "cp1252", "cp437"]
+    for encoding in dict.fromkeys(encodings):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise PortfolioDataError("Could not decode clipboard text")
 
 
 def _first(d, *keys, default=None):
