@@ -29,16 +29,30 @@ python etrade_auth.py
 python build_briefing_prompt.py
 ```
 
-To build offline from the portable portfolio already placed on the clipboard by
-`get_portfolio.py`, run:
+To build offline from the portable portfolio that `get_portfolio.py` copied to
+the clipboard, run the shortcut:
 
 ```powershell
-python build_briefing_prompt.py --from-clipboard
+.\briefing.cmd
 ```
+
+The shortcut runs `build_briefing_prompt.py --from-clipboard` with the project
+virtual environment. Use the Python command directly when you need to call the
+builder from another script.
 
 The offline path validates a versioned JSON payload embedded after the readable
 portfolio dump. It does not authenticate or contact E*TRADE. Legacy text-only
 dumps fail closed because they do not preserve exact account and lot identity.
+
+If another command overwrote the clipboard, build from the saved portfolio file
+instead:
+
+```powershell
+python build_briefing_prompt.py --input-file .\briefings\portfolio_YYYY-MM-DD.txt
+```
+
+Replace `YYYY-MM-DD` with the date in the saved filename. This is a recovery
+path, not the normal daily command.
 
 Then:
 
@@ -59,6 +73,7 @@ The daily Grok prompt does **not** reprint that dump. Lots appear once, in a sin
 | Command | Output |
 |---------|--------|
 | `build_briefing_prompt.py` | Compact decision-support prompt → clipboard + dated prompt + `weights_*.json` portfolio deltas + `observations_*.json` account/quantity/lot reconciliation |
+| `briefing.cmd` | Offline compact decision-support prompt from the structured clipboard payload → clipboard + dated prompt + snapshots |
 | `get_portfolio.py` | Full per-account dump (cost / P/L / ST-LT) → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` — local diagnostic, not pasted into Grok |
 
 ### What the briefing asks the model to analyze
@@ -143,6 +158,7 @@ Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
 | File | Role |
 |------|------|
 | `build_briefing_prompt.py` | **Daily command** — live portfolio + decision-engine prompt → clipboard |
+| `briefing.cmd` | One-command offline briefing shortcut using the structured clipboard payload |
 | `get_portfolio.py` | Portfolio block only, including cost / P/L / ST-LT |
 | etrade_auth.py | OAuth plus atomic .env token update — once per day after midnight ET |
 | `portfolio_policy.json` | Decision limits, sleeves, harvest floors, $10k examples |
@@ -209,7 +225,8 @@ This project is intentionally **read-only** against E\*TRADE:
 
 ## Tips
 
-- **Daily habit:** after midnight ET → run etrade_auth.py → run build_briefing_prompt.py → open grok.com → Ctrl+V.
+- **Daily live habit:** after midnight ET, run `etrade_auth.py`, run `build_briefing_prompt.py`, open grok.com, and press Ctrl+V.
+- **Daily offline habit:** run `get_portfolio.py`, run `briefing.cmd`, open your preferred model, and press Ctrl+V.
 - Cost basis: both scripts pull E\*TRADE average cost, total cost, unrealized P/L, and **tax lots** (so mixed ST/LT names are split correctly). That adds a few extra read-only lot calls and a few seconds.
 - Daily delta needs yesterday’s `briefings/weights_*.json` (or a prior dated prompt). Same-day re-runs compare to the last *previous calendar day*, not the earlier run today.
 - Same calendar day (US Eastern): re-run the portfolio script without re-auth unless the API rejects tokens.
