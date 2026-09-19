@@ -1,0 +1,87 @@
+Sanitized offline fixture. No live brokerage data.
+
+--- BEGIN ETRADE PORTFOLIO JSON ---
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-18T16:00:00-04:00",
+  "accounts": [
+    {
+      "label": "Brokerage (…1111)",
+      "account_ref": "fixture-taxable",
+      "tax_bucket": "taxable",
+      "account_type": "INDIVIDUAL",
+      "total_value": 1000.0,
+      "holdings": [
+        {
+          "symbol": "AAA",
+          "quantity": 5.0,
+          "price": 100.0,
+          "market_value": 500.0,
+          "price_paid": 80.0,
+          "cost_per_share": 80.0,
+          "total_cost": 400.0,
+          "total_gain": 100.0,
+          "total_gain_pct": 25.0,
+          "date_acquired": "2025-01-02T12:00:00-05:00",
+          "lots": [
+            {
+              "qty": 5.0,
+              "price": 80.0,
+              "total_cost": 400.0,
+              "total_gain": 100.0,
+              "market_value": 500.0,
+              "acquired": "2025-01-02T12:00:00-05:00",
+              "term_code": 1
+            }
+          ]
+        },
+        {
+          "symbol": "CASH",
+          "quantity": 500.0,
+          "price": 1.0,
+          "market_value": 500.0,
+          "price_paid": null,
+          "cost_per_share": null,
+          "total_cost": null,
+          "total_gain": null,
+          "total_gain_pct": null,
+          "date_acquired": null,
+          "lots": []
+        }
+      ]
+    },
+    {
+      "label": "Roth IRA (…2222)",
+      "account_ref": "fixture-roth",
+      "tax_bucket": "roth",
+      "account_type": "ROTHIRA",
+      "total_value": 500.0,
+      "holdings": [
+        {
+          "symbol": "BBB",
+          "quantity": 10.0,
+          "price": 50.0,
+          "market_value": 500.0,
+          "price_paid": 45.0,
+          "cost_per_share": 45.0,
+          "total_cost": 450.0,
+          "total_gain": 50.0,
+          "total_gain_pct": 11.1111,
+          "date_acquired": "2026-06-01T12:00:00-04:00",
+          "lots": [
+            {
+              "qty": 10.0,
+              "price": 45.0,
+              "total_cost": 450.0,
+              "total_gain": 50.0,
+              "market_value": 500.0,
+              "acquired": "2026-06-01T12:00:00-04:00",
+              "term_code": 2
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+--- END ETRADE PORTFOLIO JSON ---

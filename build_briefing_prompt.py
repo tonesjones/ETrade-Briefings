@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from argparse import ArgumentParser
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
@@ -25,6 +27,8 @@ from get_portfolio import (
     fetch_portfolio_block,
     format_lot_table,
     is_cash_symbol,
+    parse_portable_portfolio_text,
+    read_clipboard_text,
     save_portfolio_block,
 )
 from portfolio_policy import POLICY
@@ -32,6 +36,14 @@ from portfolio_policy import POLICY
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUT_DIR = PROJECT_ROOT / "prompts"
 BRIEFINGS_DIR = PROJECT_ROOT / "briefings"
+CONTEXT_PATH = PROJECT_ROOT / "portfolio_context.json"
+
+
+@dataclass(frozen=True)
+class BriefingBuildResult:
+    prompt: str
+    weights_snapshot: dict
+    observation_snapshot: dict
 
 # User-editable decision policy (portfolio_policy.json).
 AI_SEMI_CLUSTER = POLICY.sleeves["direct_ai_semi"]
@@ -50,6 +62,94 @@ CLUSTER_NO_ADD = POLICY.cluster_do_not_increase_pct
 CLUSTER_SOFT_CAP = POLICY.cluster_soft_cap_pct
 ALIASES = POLICY.aliases
 MARGINAL_EXAMPLES = POLICY.marginal_examples
+
+
+def load_portfolio_context(path: Path = CONTEXT_PATH) -> tuple[dict, str]:
+    """Load optional, user-maintained research and decision continuity data."""
+    if not path.exists():
+        return {}, "_No portfolio_context.json found; use the example file to add research continuity._"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, f"_portfolio_context.json was not usable: {exc}. Treat context as unavailable._"
+    if not isinstance(data, dict):
+        return {}, "_portfolio_context.json must contain a JSON object; treat context as unavailable._"
+    return data, f"_Loaded local portfolio context updated {data.get('updated_at', 'date not recorded')}._"
+
+
+def format_owner_profile(context: dict) -> str:
+    profile = context.get("owner_profile")
+    if not isinstance(profile, dict):
+        return "_Not supplied. Treat horizon, liquidity reserve, withdrawals, tax rate, external balance sheet, and hard limits as UNKNOWN._"
+    fields = [
+        ("Horizon", "horizon"),
+        ("Liquidity reserve", "liquidity_reserve"),
+        ("Planned withdrawals", "planned_withdrawals"),
+        ("Marginal tax rate", "marginal_tax_rate"),
+        ("External assets / liabilities", "external_assets_liabilities"),
+        ("Hard loss limit", "hard_loss_limit"),
+        ("Hard position limit", "hard_position_limit"),
+    ]
+    return "\n".join(
+        f"- **{label}:** {profile.get(key) or 'UNKNOWN'}" for label, key in fields
+    )
+
+
+def format_research_records(context: dict) -> str:
+    records = context.get("research")
+    if not isinstance(records, dict) or not records:
+        return "_No maintained research records supplied. Do not label a holding KEEP because its thesis is presumed intact._"
+    rows = []
+    for ticker, record in sorted(records.items()):
+        if not isinstance(record, dict):
+            continue
+        rows.append(
+            "| {ticker} | {reviewed} | {view} | {basis} | {valuation} | {sources} | {trigger} | {missing} |".format(
+                ticker=ticker.upper(),
+                reviewed=record.get("reviewed_at") or "UNKNOWN",
+                view=record.get("fundamental_view") or "UNKNOWN",
+                basis=record.get("decision_basis") or "UNKNOWN",
+                valuation=record.get("valuation_or_entry") or "UNKNOWN",
+                sources="; ".join(record.get("sources", [])) or "UNKNOWN",
+                trigger=record.get("decision_trigger") or "UNKNOWN",
+                missing=record.get("missing_information") or "none recorded",
+            )
+        )
+    if not rows:
+        return "_No usable research records supplied._"
+    return (
+        "| Ticker | Reviewed | Fundamental view | Decision basis | Valuation / entry | Sources | Decision trigger | Missing information |\n"
+        "|---|---|---|---|---|---|---|---|\n"
+        + "\n".join(rows)
+    )
+
+
+def format_decision_history(context: dict) -> str:
+    history = context.get("decision_history")
+    if not isinstance(history, list) or not history:
+        return "_No prior analytical proposal was captured. Use NOT CAPTURED; do not infer it from broker changes._"
+    rows = []
+    for item in history[-12:]:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            "| {date} | {scope} | {action} | {basis} | {rationale} | {trigger} | {approval} |".format(
+                date=item.get("as_of") or "UNKNOWN",
+                scope=item.get("scope") or "UNKNOWN",
+                action=item.get("portfolio_action") or "UNKNOWN",
+                basis=item.get("decision_basis") or "UNKNOWN",
+                rationale=item.get("rationale") or "UNKNOWN",
+                trigger=item.get("decision_trigger") or "UNKNOWN",
+                approval=item.get("approval_state") or "NOT RECORDED",
+            )
+        )
+    if not rows:
+        return "_No usable prior analytical proposal was captured._"
+    return (
+        "| As of | Scope | Proposal | Decision basis | Rationale | Trigger | Approval state |\n"
+        "|---|---|---|---|---|---|---|\n"
+        + "\n".join(rows)
+    )
 
 
 def sleeve_member_text(symbols: tuple[str, ...]) -> str:
@@ -380,6 +480,8 @@ def save_weights_snapshot(snap: dict, as_of: datetime) -> Path:
 
 def _account_ref(result: dict) -> str:
     """Stable non-secret account reference for local snapshot comparisons."""
+    if result.get("account_ref"):
+        return str(result["account_ref"])
     key = str(result.get("account_id_key") or result.get("label") or "unknown")
     return sha256(key.encode("utf-8")).hexdigest()[:12]
 
@@ -913,14 +1015,34 @@ def format_marginal_10k(
     return "\n".join(rows)
 
 
-def build_prompt(
+def _snapshot_coverage(as_of: datetime, prior: dict | None, prior_label: str) -> str:
+    if not prior:
+        return "No earlier snapshot is available."
+    raw_date = prior.get("date") or prior.get("as_of")
+    if not raw_date:
+        return f"Previous snapshot: {prior_label}."
+    try:
+        prior_date = datetime.fromisoformat(str(raw_date)).date()
+    except ValueError:
+        return f"Previous snapshot: {raw_date} ({prior_label})."
+    gap = (as_of.date() - prior_date).days
+    if gap > 1:
+        return (
+            f"Previous snapshot: {prior_date.isoformat()} ({gap} calendar days earlier). "
+            "No snapshots were recorded for the intervening dates; changes are cumulative."
+        )
+    return f"Previous snapshot: {prior_date.isoformat()} ({prior_label})."
+
+
+def build_briefing(
     holdings: list[dict],
     accounts: list[dict],
     grand_total: float,
     as_of: datetime,
     portfolio_block: str,
     results=None,
-) -> str:
+) -> BriefingBuildResult:
+    context, context_status = load_portfolio_context()
     as_of_str = as_of.strftime("%Y-%m-%d %H:%M")
     direct_members = "+".join(AI_SEMI_CLUSTER)
     broad_members = "+".join(BROAD_AI_LIQUID)
@@ -936,6 +1058,11 @@ def build_prompt(
 
     cash_mv = sum(h["market_value"] for h in holdings if is_cash_symbol(h["symbol"]))
     cash_w = (cash_mv / grand_total * 100) if grand_total else 0.0
+    cash_components = ", ".join(
+        f"{h['symbol']} {fmt_money(h['market_value'])}"
+        for h in holdings
+        if is_cash_symbol(h["symbol"])
+    ) or "none"
 
     top5 = holdings[:5]
     top5_w = sum(h["weight"] for h in top5)
@@ -1015,18 +1142,20 @@ def build_prompt(
         as_of,
     )
     prior_snap, prior_label = load_prior_snapshot(as_of)
-    save_weights_snapshot(today_snap, as_of)
     daily_delta = format_daily_delta(today_snap, prior_snap, prior_label)
     today_observation = observation_snapshot_dict(results, harvest_reviews, breaches, as_of)
     prior_observation, prior_observation_label = load_prior_observation(as_of)
-    save_observation_snapshot(today_observation, as_of)
     observed_delta = format_observed_delta(
         today_observation, prior_observation, prior_observation_label
     )
+    snapshot_coverage = _snapshot_coverage(as_of, prior_snap, prior_label)
     constraint_math = format_constraint_math(holdings, grand_total, cluster_mv)
     marginal_10k = format_marginal_10k(
         holdings, grand_total, cluster_mv, broad_mv, cash_mv, results=results
     )
+    owner_profile = format_owner_profile(context)
+    research_records = format_research_records(context)
+    decision_history = format_decision_history(context)
 
     prompt = f"""You are a portfolio decision-support and risk analyst assisting the account owner. Analyze the whole portfolio rather than screening stocks independently.
 
@@ -1043,8 +1172,10 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 # 1. Live book
 
 **As of:** {as_of_str} {as_of.tzname() or "ET"}
+**Snapshot coverage:** {snapshot_coverage}
 **E*TRADE total ≈ {fmt_money(grand_total)}**
 **Top-5 (E*TRADE):** {fmt_weight(top5_w)} · **Cash + cash equivalents:** {fmt_money(cash_mv)} ({fmt_weight(cash_w)})
+**Cash composition:** {cash_components}
 
 **Daily delta:**
 {daily_delta}
@@ -1078,6 +1209,16 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 
 **Account funding boundary.** Account totals do not establish usable buying power. Cash or SGOV in one account cannot fund a purchase in another without a verified transfer, settlement, and tax-aware implementation path. Treat buying power as account-specific: every DEPLOY or REPLACE names the funding account, source security/cash, settled amount, and purchasing account. Do not add cash across accounts to make a proposal appear funded.
 
+**Owner profile** (user-maintained; never infer blanks):
+{owner_profile}
+
+**Research continuity** (user-maintained; use its sources and dates, then refresh only what may be stale):
+{context_status}
+{research_records}
+
+**Decision history** (analytical proposals, not trade authority):
+{decision_history}
+
 **Consolidated holdings:**
 
 {holdings_lines}
@@ -1097,13 +1238,13 @@ Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE B
 
 **Authority and state.** E*TRADE establishes observed holdings and executions; it does not establish intent. A prior model recommendation, when supplied, is historical analytical context — never an approval or order. Never infer **USER APPROVED** from model text or **NO EXECUTION DETECTED** from approval status.
 
-**Decision continuity.** This is a continuing portfolio review, not a fresh stock screen. This builder stores broker and observation snapshots only; it has no durable model-proposal record and cannot capture a response generated outside this workflow. For every prior model proposal explicitly supplied in the input, classify today's proposal as **UNCHANGED / MODIFIED / REVERSED / RESOLVED**. Otherwise say **NOT CAPTURED**; do not reconstruct it from position data, account changes, or snapshots.
+**Decision continuity.** This is a continuing portfolio review, not a fresh stock screen. Use the supplied Decision history table as the only durable proposal record. For every prior model proposal there, classify today's proposal as **UNCHANGED / MODIFIED / REVERSED / RESOLVED**. Otherwise say **NOT CAPTURED**; do not reconstruct it from position data, account changes, or snapshots.
 
 A MODIFIED or REVERSED proposal requires at least one qualifying delta: material company-specific evidence; earnings/guidance/regulatory/competitive change; price or valuation movement material to the original thesis; portfolio-weight/factor/liquidity/tax change; observed execution; or a specific error in the prior analysis. State the prior proposal, new proposal, dated new fact, invalidated assumption, and why the change is sufficient. “Reassessment,” “updated outlook,” “fresh analysis,” and “greater upside” are not sufficient.
 
-**Fundamental view ≠ portfolio action.** Report both independently. Fundamental View is **ATTRACTIVE / NEUTRAL / UNATTRACTIVE / INSUFFICIENT EVIDENCE**. Portfolio Action uses only **KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION**. A fundamentally attractive or neutral security may still warrant REDUCE or REPLACE because of concentration, TLH, account location, factor exposure, opportunity cost, or a superior replacement. A negative view does not automatically justify a sale when tax, evidence, sizing, or replacement quality argues for NO ACTION.
+**Fundamental view ≠ portfolio action.** Report both independently. Fundamental View is **ATTRACTIVE / NEUTRAL / UNATTRACTIVE / INSUFFICIENT EVIDENCE**. Portfolio Action uses only **KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION**. Also state Decision Basis: **THESIS SUPPORTED / ENTRY UNATTRACTIVE / RESEARCH INCOMPLETE / IMPLEMENTATION BLOCKED / TRADE BAR MET**. **KEEP requires THESIS SUPPORTED with dated research evidence.** When research is missing or stale, use **NO ACTION / RESEARCH INCOMPLETE**, name the missing metric or source checked, and do not imply the thesis was reconfirmed.
 
-**Owner profile and hard limits.** The live book does not establish the owner's horizon, liquidity reserve, planned withdrawals, marginal tax rate, external assets/liabilities, or hard loss and position limits. Treat each as **UNKNOWN** unless supplied. Do not infer a risk budget from the current holdings; when a missing item could change an action, use **NO ACTION / NEEDS REVIEW** and identify it.
+**Owner profile and hard limits.** Use only supplied profile fields. Treat omitted fields as **UNKNOWN**. Do not infer a risk budget from the current holdings; when a missing item could change an action, use **NO ACTION / NEEDS REVIEW** and identify it.
 
 **Tax.** No ST/LT capital-gains tax on Traditional IRA / Roth. A taxable loss creates a review candidate, not an automatic sale. Wash-sale status must be **CLEAR / POSSIBLE / UNKNOWN** and must state the information scope checked. If relevant accounts, spouse activity, automatic purchases, options, open orders, or the surrounding 61-day transaction window are unavailable, do not claim the loss is usable; say **NEEDS TAX REVIEW**. A backward-looking **CLEAR** status never authorizes the trade or a replacement purchase: before a taxable-loss sale, also state the next 30-day restriction on substantially identical purchases, reinvestments, options, and all relevant accounts.
 
@@ -1123,7 +1264,7 @@ Evaluate the risk of continuing to hold as explicitly as the risk of trading. Ow
 
 **Thesis vs price.** Score thesis · valuation · trend · catalyst separately. Price is a trigger, not a thesis — classify moves as market / factor / company / execution / noise. Use a decision trigger, not a vague standalone “hold 6–12 months” horizon.
 
-**Decision quality.** For every actionable proposal, show the chain **dated evidence → change in business expectations or portfolio risk → valuation at the stated price → advantage over holding unchanged and the best feasible alternative → account-specific implementation**. State what must be true, the strongest evidence against the proposal, and the observable invalidation trigger. Use the same scrutiny for KEEP as for trading. Do not manufacture valuation ranges, probabilities, expected returns, or precision when inputs are inadequate. Evaluate whether reasonable changes in key assumptions reverse the recommendation; if so, label it **FRAGILE** and identify the missing evidence.
+**Decision quality.** For every actionable proposal, show the chain **dated evidence → change in business expectations or portfolio risk → valuation at the stated price → advantage over holding unchanged and the best feasible alternative → account-specific implementation**. State what must be true, the strongest evidence against the proposal, and the observable invalidation trigger. Use the same scrutiny for KEEP as for trading. Preserve financial reporting period, metric definition, and source URL or filing reference. Do not manufacture valuation ranges, probabilities, expected returns, or precision when inputs are inadequate. Evaluate whether reasonable changes in key assumptions reverse the recommendation; if so, label it **FRAGILE** and identify the missing evidence.
 
 **TLH proposal requirements.** REDUCE or REPLACE for TLH must state: exact taxable account and lot/lot group; quantity and expected realized loss; wash-sale status and scope; named replacement or explicit cash destination; exposure preserved or intentionally changed; and why expected after-tax benefit exceeds spread, complexity, and opportunity cost. A usable loss alone does not clear the trade bar. Apply the owner deployment preference: require an immediately attractive replacement unless a hard-risk case independently makes cash the superior destination. Fundamental weakness is not required, but the portfolio case must stand on its own.
 
@@ -1147,19 +1288,53 @@ A ticker is not one lot (taxable LT ≠ taxable ST ≠ IRA). Compare at least tw
 
 **2. Regime / stress** — only what changes a decision. Directional (no fake VaR): Nasdaq −10%; semi −15%; AI-capex down; rates spike; broad correction without AI damage.
 
-**3. Decision reconciliation** — compact table: Ticker · Prior Model Proposal · Current Proposal · Continuity (UNCHANGED/MODIFIED/REVERSED/RESOLVED/NOT CAPTURED) · Observed Account Change · Qualifying Delta · Approval State. A prior proposal is not approval. No E*TRADE change means NO EXECUTION DETECTED, not “pending.”
+**3. Decision reconciliation** — compact table: Ticker · Prior Model Proposal · Current Proposal · Continuity (UNCHANGED/MODIFIED/REVERSED/RESOLVED/NOT CAPTURED) · Observed Account Change · Qualifying Delta · Approval State. Reconcile against the supplied Decision history, not memory or inferred broker state. A prior proposal is not approval. No E*TRADE change means NO EXECUTION DETECTED, not “pending.”
 
-**4. Must-analyze** — every name listed in §1. Do not omit a name because it is under {ANALYZE_WEIGHT_FLOOR:g}%; taxable-harvest and material-loss names stay in. Compact table: Ticker · Fundamental View · Portfolio Action · Confidence · Prior Proposal/Status · last · avg/cost · P/L · term/account · target wt · verified evidence · missing information · decision trigger. Apply the tax engine and two-source comparison only to REDUCE or REPLACE.
+**4. Must-analyze** — every name listed in §1. Do not omit a name because it is under {ANALYZE_WEIGHT_FLOOR:g}%; taxable-harvest and material-loss names stay in. Compact table: Ticker · Fundamental View · Portfolio Action · Decision Basis · Confidence · Prior Proposal/Status · last · avg/cost · P/L · term/account · target wt · verified evidence · missing information · decision trigger. Apply the tax engine and two-source comparison only to REDUCE or REPLACE.
 
 **5. New ideas** — required table with 2–3 tickers not currently held: Rank · Ticker · Conviction (High/Medium/Low) · Portfolio role · Fundamental View · Portfolio Action (DEPLOY/NO ACTION) · Candidate Status (ACTIONABLE/WATCH) · Why now (verified, dated evidence) · Valuation/entry discipline · Principal risk · Comparison with the best two relevant holdings · $10k direct/broad/cash/top-5 impact · decision trigger. Do not force a DEPLOY action when cash, evidence, valuation, or portfolio fit does not clear the trade bar.
 
-**6. Cash / tax / post-trade** — SGOV plan (now {fmt_money(cash_mv)}). If any proposed trade: min $ vs recommended; estimated ST/LT tax; wash-sale status/scope; updated cash, top-5, direct %, broad %, $10k of the trade; and a dollar-for-dollar proceeds deployment table. Re-rank top-five membership after the proposed trade and identify the actual funding and purchasing accounts. A concentration sale may leave proceeds idle only when the hard-risk case for cash is explicit. Nasdaq beta: up / similar / down. No fake expected-return or drawdown to one decimal.
+**6. Cash / tax / post-trade** — Cash-equivalent plan (now {fmt_money(cash_mv)}; composition above). If any proposed trade: min $ vs recommended; estimated ST/LT tax; wash-sale status/scope; updated cash, top-5, direct %, broad %, $10k of the trade; and a dollar-for-dollar proceeds deployment table. Re-rank top-five membership after the proposed trade and identify the actual funding and purchasing accounts. A concentration sale may leave proceeds idle only when the hard-risk case for cash is explicit. Nasdaq beta: up / similar / down. No fake expected-return or drawdown to one decimal.
 
 **7. Decision triggers** — only names touched, under observable review, near a limit, or listed as a new idea. Use the allowed Portfolio Action values; WATCH is a candidate status, not a Portfolio Action. One line each: the specific observable condition that would make today's proposal wrong or require review.
 
 **Appendix — monitoring only** — one short line per unchanged must-analyze holding or candidate: Ticker · **NO MATERIAL UPDATE** · next observable trigger. Do not repeat the executive recommendation, health section, or full position tables here.
 """
-    return prompt.strip() + "\n"
+    return BriefingBuildResult(
+        prompt=prompt.strip() + "\n",
+        weights_snapshot=today_snap,
+        observation_snapshot=today_observation,
+    )
+
+
+def build_prompt(
+    holdings: list[dict],
+    accounts: list[dict],
+    grand_total: float,
+    as_of: datetime,
+    portfolio_block: str,
+    results=None,
+) -> str:
+    """Compatibility wrapper for callers that only need prompt text."""
+    return build_briefing(
+        holdings, accounts, grand_total, as_of, portfolio_block, results=results
+    ).prompt
+
+
+def save_briefing_result(
+    result: BriefingBuildResult, portfolio_block: str, as_of: datetime
+) -> tuple[Path, Path]:
+    """Persist a fully built briefing. Snapshot writes happen last."""
+    save_portfolio_block(portfolio_block, as_of=as_of)
+    OUT_DIR.mkdir(exist_ok=True)
+    date_str = as_of.strftime("%Y-%m-%d")
+    dated = OUT_DIR / f"daily_briefing_prompt_{date_str}.md"
+    latest = OUT_DIR / "daily_briefing_prompt_latest.md"
+    atomic_write_text(dated, result.prompt)
+    atomic_write_text(latest, result.prompt)
+    save_weights_snapshot(result.weights_snapshot, as_of)
+    save_observation_snapshot(result.observation_snapshot, as_of)
+    return dated, latest
 
 
 def main(argv=None) -> int:
@@ -1169,24 +1344,43 @@ def main(argv=None) -> int:
         action="store_true",
         help="Generate an unsafe marked prompt when an account fails.",
     )
-    args = parser.parse_args(argv)
-    print("Fetching live E*TRADE portfolio...")
-    formatted, grand_total, npos, results, as_of = fetch_portfolio_block(
-        verbose=True, allow_partial=args.allow_partial
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "--from-clipboard",
+        action="store_true",
+        help="Build offline from the portable payload on the Windows clipboard.",
     )
-    save_portfolio_block(formatted, as_of=as_of)
+    source.add_argument(
+        "--input-file",
+        help="Build offline from a portable payload file, or '-' for stdin.",
+    )
+    args = parser.parse_args(argv)
+    if args.from_clipboard or args.input_file:
+        if args.allow_partial:
+            parser.error("--allow-partial is only available for live fetching")
+        print("Loading portable portfolio without contacting E*TRADE...")
+        if args.from_clipboard:
+            pasted = read_clipboard_text()
+        elif args.input_file == "-":
+            pasted = sys.stdin.read()
+        else:
+            pasted = Path(args.input_file).read_text(encoding="utf-8")
+        formatted, grand_total, npos, results, as_of = parse_portable_portfolio_text(
+            pasted
+        )
+    else:
+        print("Fetching live E*TRADE portfolio...")
+        formatted, grand_total, npos, results, as_of = fetch_portfolio_block(
+            verbose=True, allow_partial=args.allow_partial
+        )
 
     holdings, accounts = consolidate(results, grand_total)
-    prompt = build_prompt(holdings, accounts, grand_total, as_of, formatted, results=results)
+    result = build_briefing(
+        holdings, accounts, grand_total, as_of, formatted, results=results
+    )
+    dated, latest = save_briefing_result(result, formatted, as_of)
 
-    OUT_DIR.mkdir(exist_ok=True)
-    date_str = as_of.strftime("%Y-%m-%d")
-    dated = OUT_DIR / f"daily_briefing_prompt_{date_str}.md"
-    latest = OUT_DIR / "daily_briefing_prompt_latest.md"
-    atomic_write_text(dated, prompt)
-    atomic_write_text(latest, prompt)
-
-    clipped = copy_to_clipboard(prompt)
+    clipped = copy_to_clipboard(result.prompt)
 
     print()
     print("=" * 60)

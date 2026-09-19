@@ -15,6 +15,42 @@ ET = ZoneInfo("America/New_York")
 
 
 class PortfolioParsingTests(unittest.TestCase):
+    def test_portable_payload_round_trip_preserves_accounts_lots_and_timestamp(self):
+        fixture = Path(__file__).parent / "fixtures" / "portable_portfolio.txt"
+        text = fixture.read_text(encoding="utf-8")
+        formatted, total, positions, results, as_of = portfolio.parse_portable_portfolio_text(text)
+        self.assertIn("Sanitized offline fixture", formatted)
+        self.assertEqual(total, 1500.0)
+        self.assertEqual(positions, 2)
+        self.assertEqual(as_of.isoformat(), "2026-09-18T16:00:00-04:00")
+        self.assertEqual(results[0]["tax_bucket"], "taxable")
+        self.assertEqual(results[0]["account_ref"], "fixture-taxable")
+        self.assertEqual(results[0]["holdings"][0]["lots"][0]["qty"], 5.0)
+        self.assertEqual(results[1]["tax_bucket"], "roth")
+
+    def test_legacy_human_dump_fails_closed(self):
+        with self.assertRaisesRegex(portfolio.PortfolioDataError, "structured payload"):
+            portfolio.parse_portable_portfolio_text("**Portfolio (live from E*TRADE)**")
+
+    def test_portable_payload_hashes_raw_account_key(self):
+        raw_key = "raw-secret-account-key"
+        payload = portfolio.portable_portfolio_payload(
+            [
+                {
+                    "label": "Brokerage (…1111)",
+                    "account_id_key": raw_key,
+                    "tax_bucket": "taxable",
+                    "account_type": "INDIVIDUAL",
+                    "total_value": 10.0,
+                    "holdings": [],
+                }
+            ],
+            datetime(2026, 9, 18, tzinfo=ET),
+        )
+        encoded = json.dumps(payload)
+        self.assertNotIn(raw_key, encoded)
+        self.assertEqual(len(payload["accounts"][0]["account_ref"]), 12)
+
     def test_exact_one_year_is_short_term(self):
         acquired = datetime(2025, 8, 12, tzinfo=ET)
         self.assertEqual(
@@ -171,6 +207,135 @@ class CashLotTests(unittest.TestCase):
 
 
 class BriefingPolicyTests(unittest.TestCase):
+    def test_offline_input_never_fetches_and_persists_after_build(self):
+        fixture = Path(__file__).parent / "fixtures" / "portable_portfolio.txt"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            briefings = root / "briefings"
+            prompts = root / "prompts"
+            briefings.mkdir()
+            prompts.mkdir()
+            (briefings / "weights_2026-09-15.json").write_text(
+                json.dumps({"date": "2026-09-15", "holdings": []}),
+                encoding="utf-8",
+            )
+            (briefings / "observations_2026-09-15.json").write_text(
+                json.dumps({"date": "2026-09-15", "positions": [], "reviews": []}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(briefing, "BRIEFINGS_DIR", briefings),
+                patch.object(briefing, "OUT_DIR", prompts),
+                patch.object(briefing, "CONTEXT_PATH", root / "missing-context.json"),
+                patch.object(
+                    briefing,
+                    "fetch_portfolio_block",
+                    side_effect=AssertionError("network path used"),
+                ),
+                patch.object(briefing, "copy_to_clipboard", return_value=True),
+                patch.object(portfolio, "PROJECT_ROOT", root),
+            ):
+                exit_code = briefing.main(["--input-file", str(fixture)])
+            self.assertEqual(exit_code, 0)
+            prompt = (prompts / "daily_briefing_prompt_2026-09-18.md").read_text(encoding="utf-8")
+            self.assertIn("3 calendar days earlier", prompt)
+            self.assertIn("changes are cumulative", prompt)
+            self.assertTrue((briefings / "weights_2026-09-18.json").exists())
+            self.assertTrue((briefings / "observations_2026-09-18.json").exists())
+
+    def test_invalid_offline_input_writes_no_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "legacy.txt"
+            source.write_text("legacy human-readable dump", encoding="utf-8")
+            briefings = root / "briefings"
+            prompts = root / "prompts"
+            with (
+                patch.object(briefing, "BRIEFINGS_DIR", briefings),
+                patch.object(briefing, "OUT_DIR", prompts),
+                patch.object(
+                    briefing,
+                    "fetch_portfolio_block",
+                    side_effect=AssertionError("network path used"),
+                ),
+            ):
+                with self.assertRaises(portfolio.PortfolioDataError):
+                    briefing.main(["--input-file", str(source)])
+            self.assertFalse(briefings.exists())
+            self.assertFalse(prompts.exists())
+
+    def test_context_loader_and_formatters_preserve_dated_research(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portfolio_context.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": "2026-09-08",
+                        "owner_profile": {"horizon": "10+ years"},
+                        "research": {
+                            "ABC": {
+                                "reviewed_at": "2026-09-07",
+                                "fundamental_view": "ATTRACTIVE",
+                                "decision_basis": "THESIS SUPPORTED",
+                                "valuation_or_entry": "FCF yield above 4%",
+                                "decision_trigger": "Revenue growth below 5%",
+                            }
+                        },
+                        "decision_history": [
+                            {
+                                "as_of": "2026-09-07",
+                                "scope": "ABC",
+                                "portfolio_action": "KEEP",
+                                "decision_basis": "THESIS SUPPORTED",
+                                "decision_trigger": "Revenue growth below 5%",
+                                "approval_state": "NOT APPROVED",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            context, status = briefing.load_portfolio_context(path)
+        self.assertIn("2026-09-08", status)
+        self.assertIn("10+ years", briefing.format_owner_profile(context))
+        self.assertIn("FCF yield above 4%", briefing.format_research_records(context))
+        self.assertIn("NOT APPROVED", briefing.format_decision_history(context))
+
+    def test_prompt_requires_research_basis_and_separates_cash_components(self):
+        as_of = datetime(2026, 8, 12, 16, 0, tzinfo=ET)
+        holdings = [
+            {
+                "symbol": "SGOV", "market_value": 900.0, "weight": 90.0, "price": 100.0,
+                "alias": None, "quantity": 9.0, "cost_per_share": None, "price_paid": None,
+                "total_cost": None, "total_gain": None, "total_gain_pct": None, "lots": [],
+                "tax_buckets": {"taxable"}, "taxable_mv": 900.0, "ira_mv": 0.0, "roth_mv": 0.0,
+            },
+            {
+                "symbol": "CASH", "market_value": 100.0, "weight": 10.0, "price": 1.0,
+                "alias": None, "quantity": 100.0, "cost_per_share": None, "price_paid": None,
+                "total_cost": None, "total_gain": None, "total_gain_pct": None, "lots": [],
+                "tax_buckets": {"taxable"}, "taxable_mv": 100.0, "ira_mv": 0.0, "roth_mv": 0.0,
+            },
+        ]
+        with patch.object(briefing, "load_portfolio_context", return_value=({}, "_No context._")):
+            prompt = briefing.build_prompt(
+                holdings,
+                [
+                    {
+                        "label": "Brokerage (…7810)",
+                        "total": 1000.0,
+                        "tax_bucket": "taxable",
+                    }
+                ],
+                1000.0,
+                as_of,
+                "unused",
+                results=[],
+            )
+        self.assertIn("**Cash composition:** SGOV $900, CASH $100", prompt)
+        self.assertIn("KEEP requires THESIS SUPPORTED with dated research evidence", prompt)
+        self.assertIn("NO ACTION / RESEARCH INCOMPLETE", prompt)
+
     def test_harvest_flag_uses_policy_cutoff(self):
         as_of = datetime(2026, 8, 12, tzinfo=ET)
 
@@ -314,7 +479,7 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertIn("A usable loss alone does not clear the trade bar", prompt)
         self.assertIn("Only after a proposed **REDUCE** or **REPLACE**", prompt)
         self.assertIn("Account funding boundary", prompt)
-        self.assertIn("no durable model-proposal record", prompt)
+        self.assertIn("Decision history table as the only durable proposal record", prompt)
         self.assertIn("Owner profile and hard limits", prompt)
         self.assertIn("next 30-day restriction", prompt)
         self.assertIn("Static sleeve membership is only a lower-bound", prompt)

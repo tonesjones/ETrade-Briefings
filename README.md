@@ -29,6 +29,17 @@ python etrade_auth.py
 python build_briefing_prompt.py
 ```
 
+To build offline from the portable portfolio already placed on the clipboard by
+`get_portfolio.py`, run:
+
+```powershell
+python build_briefing_prompt.py --from-clipboard
+```
+
+The offline path validates a versioned JSON payload embedded after the readable
+portfolio dump. It does not authenticate or contact E*TRADE. Legacy text-only
+dumps fail closed because they do not preserve exact account and lot identity.
+
 Then:
 
 1. Open your preferred model
@@ -136,6 +147,7 @@ Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
 | etrade_auth.py | OAuth plus atomic .env token update — once per day after midnight ET |
 | `portfolio_policy.json` | Decision limits, sleeves, harvest floors, $10k examples |
 | `portfolio_policy.py` | Loads and validates that JSON |
+| `portfolio_context.example.json` | Template for local owner constraints, dated research, and prior analytical proposals |
 | `.env` | Secrets (gitignored) |
 | `.env.example` | Template for secrets |
 | `briefings/` | Dated portfolio blocks + weight and observation snapshots (gitignored) |
@@ -166,6 +178,16 @@ All briefing math and most instruction text read `portfolio_policy.json`. Edit t
 | `marginal_examples` | Rows in the pre-computed $10k table. `symbol` may be `null` for a generic diversifier. |
 
 `schema_version` must stay `1`. Missing required sleeves abort load.
+
+## Research continuity
+
+Copy `portfolio_context.example.json` to `portfolio_context.json` and fill it in locally. The daily prompt reads this optional file and keeps it out of Git. It has three deliberately small sections:
+
+- `owner_profile`: horizon, cash reserve, withdrawal, tax, and hard-limit facts that the broker cannot supply.
+- `research`: one dated record per held name or recurring candidate, including the valuation or entry condition, decision trigger, metrics, and primary sources.
+- `decision_history`: prior analytical proposals and their conditions. Record approval or confirmed execution only when you have that evidence; a model recommendation itself is not approval.
+
+The prompt requires a dated `THESIS SUPPORTED` record for `KEEP`. When no current research record exists, it directs the analyst to use `NO ACTION / RESEARCH INCOMPLETE` and name the missing fact. Keep completed research concise and update it after earnings or a material event; daily runs should only refresh facts that may have changed.
 
 ---
 

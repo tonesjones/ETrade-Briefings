@@ -19,16 +19,20 @@ No preview, place, cancel, or change-order calls exist in this repo.
 
 from __future__ import annotations
 
-import os
+import json
 import logging
+import os
 import subprocess
 import time
 from argparse import ArgumentParser
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
+
 import pyetrade
+from dotenv import load_dotenv
+
 from portfolio_policy import POLICY
 
 # Explicit allow-list: only the Accounts API surface is used (list + portfolio).
@@ -47,6 +51,9 @@ CASH_SYMBOLS = POLICY.cash_symbols
 # Residual NAV-vs-mark gaps below this are noise, not sweep cash.
 CASH_RESIDUAL_FLOOR = 1.0
 LOGGER = logging.getLogger(__name__)
+PORTABLE_BEGIN = "--- BEGIN ETRADE PORTFOLIO JSON ---"
+PORTABLE_END = "--- END ETRADE PORTFOLIO JSON ---"
+PORTABLE_SCHEMA_VERSION = 1
 
 class PortfolioDataError(RuntimeError):
     """The API response was incomplete or could not be validated."""
@@ -54,6 +61,198 @@ class PortfolioDataError(RuntimeError):
 
 class IncompletePortfolioError(PortfolioDataError):
     """One or more selected accounts could not be loaded completely."""
+
+
+def _portable_datetime(value):
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _portable_holding(holding: dict) -> dict:
+    keys = (
+        "symbol", "quantity", "price", "market_value", "price_paid",
+        "cost_per_share", "total_cost", "total_gain", "total_gain_pct",
+    )
+    item = {key: holding.get(key) for key in keys}
+    item["date_acquired"] = _portable_datetime(holding.get("date_acquired"))
+    item["lots"] = [
+        {
+            "qty": lot.get("qty"),
+            "price": lot.get("price"),
+            "total_cost": lot.get("total_cost"),
+            "total_gain": lot.get("total_gain"),
+            "market_value": lot.get("market_value"),
+            "acquired": _portable_datetime(lot.get("acquired")),
+            "term_code": lot.get("term_code"),
+        }
+        for lot in holding.get("lots") or []
+    ]
+    return item
+
+
+def portable_portfolio_payload(results: list[dict], as_of: datetime) -> dict:
+    """Return a sanitized, exact payload for offline briefing generation."""
+    failures = [result for result in results if result.get("error")]
+    if failures:
+        raise IncompletePortfolioError(
+            "Portable portfolio payload requires complete account data."
+        )
+    accounts = []
+    for result in results:
+        stable_source = str(result.get("account_id_key") or result.get("label") or "")
+        accounts.append({
+            "label": result.get("label"),
+            "account_ref": sha256(stable_source.encode("utf-8")).hexdigest()[:12],
+            "tax_bucket": result.get("tax_bucket") or "taxable",
+            "account_type": result.get("account_type"),
+            "total_value": result.get("total_value"),
+            "holdings": [
+                _portable_holding(holding)
+                for holding in result.get("holdings") or []
+            ],
+        })
+    return {
+        "schema_version": PORTABLE_SCHEMA_VERSION,
+        "observed_at": as_of.isoformat(),
+        "accounts": accounts,
+    }
+
+
+def format_portable_portfolio_text(
+    formatted: str, results: list[dict], as_of: datetime
+) -> str:
+    payload = json.dumps(portable_portfolio_payload(results, as_of), indent=2)
+    return f"{formatted.rstrip()}\n\n{PORTABLE_BEGIN}\n{payload}\n{PORTABLE_END}\n"
+
+
+def _parse_portable_datetime(value, field: str) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError as exc:
+        raise PortfolioDataError(f"Invalid {field} timestamp in pasted portfolio") from exc
+    return to_et(parsed)
+
+
+def parse_portable_portfolio_text(text: str):
+    """Parse a versioned clipboard payload without contacting E*TRADE."""
+    if PORTABLE_BEGIN not in text or PORTABLE_END not in text:
+        raise PortfolioDataError(
+            "Pasted portfolio is missing the structured payload. Re-run "
+            "get_portfolio.py with the current version and paste its clipboard output."
+        )
+    before, remainder = text.split(PORTABLE_BEGIN, 1)
+    raw_json, _after = remainder.split(PORTABLE_END, 1)
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise PortfolioDataError("Pasted portfolio JSON is malformed") from exc
+    if payload.get("schema_version") != PORTABLE_SCHEMA_VERSION:
+        raise PortfolioDataError("Unsupported pasted portfolio schema")
+    as_of = _parse_portable_datetime(payload.get("observed_at"), "observed_at")
+    if as_of is None:
+        raise PortfolioDataError("Pasted portfolio is missing observed_at")
+    raw_accounts = payload.get("accounts")
+    if not isinstance(raw_accounts, list) or not raw_accounts:
+        raise PortfolioDataError("Pasted portfolio has no accounts")
+
+    results = []
+    for account in raw_accounts:
+        if not isinstance(account, dict):
+            raise PortfolioDataError("Pasted portfolio account is malformed")
+        label = str(account.get("label") or "").strip()
+        account_ref = str(account.get("account_ref") or "").strip()
+        tax_bucket = account.get("tax_bucket") or "taxable"
+        total_value = _as_float(account.get("total_value"), default=None)
+        if not label or not account_ref or total_value is None or total_value < 0:
+            raise PortfolioDataError("Pasted portfolio account metadata is incomplete")
+        if tax_bucket not in {"taxable", "traditional", "roth"}:
+            raise PortfolioDataError("Pasted portfolio has an invalid tax bucket")
+        raw_holdings = account.get("holdings")
+        if not isinstance(raw_holdings, list):
+            raise PortfolioDataError("Pasted portfolio holdings are malformed")
+        holdings = []
+        for raw_holding in raw_holdings:
+            if not isinstance(raw_holding, dict):
+                raise PortfolioDataError("Pasted portfolio holding is malformed")
+            symbol = str(raw_holding.get("symbol") or "").upper().strip()
+            quantity = _as_float(raw_holding.get("quantity"), default=None)
+            price = _as_float(raw_holding.get("price"), default=None)
+            market_value = _as_float(raw_holding.get("market_value"), default=None)
+            if not symbol or quantity is None or price is None or market_value is None:
+                raise PortfolioDataError("Pasted portfolio holding metadata is incomplete")
+            lots = []
+            for raw_lot in raw_holding.get("lots") or []:
+                if not isinstance(raw_lot, dict):
+                    raise PortfolioDataError("Pasted portfolio lot is malformed")
+                lot_qty = _as_float(raw_lot.get("qty"), default=None)
+                if lot_qty is None or lot_qty <= 0:
+                    raise PortfolioDataError("Pasted portfolio lot quantity is invalid")
+                lots.append({
+                    "qty": lot_qty,
+                    "price": _as_float(raw_lot.get("price"), default=None),
+                    "total_cost": _as_float(raw_lot.get("total_cost"), 0.0) or 0.0,
+                    "total_gain": _as_float(raw_lot.get("total_gain"), 0.0) or 0.0,
+                    "market_value": _as_float(raw_lot.get("market_value"), 0.0) or 0.0,
+                    "acquired": _parse_portable_datetime(raw_lot.get("acquired"), "lot acquired"),
+                    "term_code": (
+                        int(raw_lot["term_code"])
+                        if raw_lot.get("term_code") is not None
+                        else None
+                    ),
+                })
+            holdings.append({
+                "symbol": symbol,
+                "quantity": quantity,
+                "price": price,
+                "market_value": market_value,
+                "price_paid": _as_float(raw_holding.get("price_paid"), default=None),
+                "cost_per_share": _as_float(raw_holding.get("cost_per_share"), default=None),
+                "total_cost": _as_float(raw_holding.get("total_cost"), default=None),
+                "total_gain": _as_float(raw_holding.get("total_gain"), default=None),
+                "total_gain_pct": _as_float(raw_holding.get("total_gain_pct"), default=None),
+                "date_acquired": _parse_portable_datetime(
+                    raw_holding.get("date_acquired"), "holding acquired"
+                ),
+                "position_id": None,
+                "lots_details": None,
+                "lots": lots,
+            })
+        position_total = sum(h["market_value"] for h in holdings)
+        if position_total > total_value + 1.0:
+            raise PortfolioDataError(
+                f"Pasted portfolio positions exceed account total for {label}"
+            )
+        results.append({
+            "label": label,
+            "holdings": holdings,
+            "total_value": total_value,
+            "account_id_key": None,
+            "account_ref": account_ref,
+            "tax_bucket": tax_bucket,
+            "account_type": account.get("account_type"),
+        })
+
+    formatted, grand_total, total_positions = format_all_for_briefing(results, as_of)
+    supplied_total = sum(result["total_value"] for result in results)
+    if abs(grand_total - supplied_total) > 0.01:
+        raise PortfolioDataError("Pasted portfolio account totals do not reconcile")
+    reusable_text = text.strip() if before.strip() else format_portable_portfolio_text(
+        formatted, results, as_of
+    ).strip()
+    return reusable_text, grand_total, total_positions, results, as_of
+
+
+def read_clipboard_text() -> str:
+    """Read the Windows clipboard as text."""
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return completed.stdout
 
 
 def _first(d, *keys, default=None):
@@ -1068,8 +1267,9 @@ def main(argv=None) -> int:
     formatted, grand_total, total_positions, _results, as_of = fetch_portfolio_block(
         allow_partial=args.allow_partial
     )
-    path = save_portfolio_block(formatted, as_of=as_of)
-    clipped = copy_to_clipboard(formatted)
+    portable = format_portable_portfolio_text(formatted, _results, as_of)
+    path = save_portfolio_block(portable, as_of=as_of)
+    clipped = copy_to_clipboard(portable)
 
     print()
     print(formatted)
@@ -1077,9 +1277,9 @@ def main(argv=None) -> int:
     print(f"Positions found: {total_positions} | Grand total: USD {grand_total:,.0f}")
     print(f"Saved: {path}")
     if clipped:
-        print("Clipboard: portfolio block copied — paste into grok.com (Ctrl+V)")
+        print("Clipboard: portable portfolio copied — use it for offline briefing generation")
     else:
-        print("Clipboard: could not copy automatically — select the block above manually")
+        print(f"Clipboard: could not copy automatically — use --input-file {path}")
     print("-" * 50)
     print("\nNext: open grok.com → paste into your Daily Portfolio Action Briefing prompt.")
     return 0

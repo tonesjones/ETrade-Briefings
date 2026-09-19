@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "updated_at": "YYYY-MM-DD",
+  "owner_profile": {
+    "horizon": "UNKNOWN",
+    "liquidity_reserve": "UNKNOWN",
+    "planned_withdrawals": "UNKNOWN",
+    "marginal_tax_rate": "UNKNOWN",
+    "external_assets_liabilities": "UNKNOWN",
+    "hard_loss_limit": "UNKNOWN",
+    "hard_position_limit": "UNKNOWN"
+  },
+  "research": {
+    "EXAMPLE": {
+      "reviewed_at": "YYYY-MM-DD",
+      "fundamental_view": "ATTRACTIVE | NEUTRAL | UNATTRACTIVE | INSUFFICIENT EVIDENCE",
+      "decision_basis": "THESIS SUPPORTED | ENTRY UNATTRACTIVE | RESEARCH INCOMPLETE | IMPLEMENTATION BLOCKED | TRADE BAR MET",
+      "valuation_or_entry": "Metric, period, current mark/session, and entry condition",
+      "decision_trigger": "Specific observable condition",
+      "key_metrics": "Metric names, values, periods, and definitions",
+      "sources": ["Primary source URL or filing reference with publication date"],
+      "missing_information": "What would change the conclusion"
+    }
+  },
+  "decision_history": [
+    {
+      "as_of": "YYYY-MM-DD",
+      "scope": "EXAMPLE or Portfolio",
+      "portfolio_action": "KEEP | REDUCE | REPLACE | DEPLOY | NO ACTION",
+      "decision_basis": "THESIS SUPPORTED | ENTRY UNATTRACTIVE | RESEARCH INCOMPLETE | IMPLEMENTATION BLOCKED | TRADE BAR MET",
+      "rationale": "Dated evidence and the decision it supported",
+      "decision_trigger": "Specific observable condition",
+      "approval_state": "NOT APPROVED | USER APPROVED | EXECUTED CONFIRMED"
+    }
+  ]
+}

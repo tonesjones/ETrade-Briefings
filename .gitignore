@@ -11,6 +11,7 @@ credentials*.json
 briefings/
 prompts/
 logs/
+portfolio_context.json
 
 # Python
 __pycache__/
