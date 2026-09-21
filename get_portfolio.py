@@ -51,6 +51,9 @@ except Exception:
 CASH_SYMBOLS = POLICY.cash_symbols
 # Residual NAV-vs-mark gaps below this are noise, not sweep cash.
 CASH_RESIDUAL_FLOOR = 1.0
+# Account balances and position marks arrive from separate E*TRADE responses.
+# Permit a small mark-timing difference, but reject a materially incomplete payload.
+PORTABLE_RECONCILIATION_TOLERANCE_PCT = 0.0001
 LOGGER = logging.getLogger(__name__)
 PORTABLE_BEGIN = "--- BEGIN ETRADE PORTFOLIO JSON ---"
 PORTABLE_END = "--- END ETRADE PORTFOLIO JSON ---"
@@ -133,6 +136,11 @@ def _parse_portable_datetime(value, field: str) -> datetime | None:
     except ValueError as exc:
         raise PortfolioDataError(f"Invalid {field} timestamp in pasted portfolio") from exc
     return to_et(parsed)
+
+
+def portable_reconciliation_tolerance(account_total: float) -> float:
+    """Return the largest acceptable account-mark timing difference in dollars."""
+    return max(CASH_RESIDUAL_FLOOR, account_total * PORTABLE_RECONCILIATION_TOLERANCE_PCT)
 
 
 def parse_portable_portfolio_text(text: str):
@@ -220,9 +228,12 @@ def parse_portable_portfolio_text(text: str):
                 "lots": lots,
             })
         position_total = sum(h["market_value"] for h in holdings)
-        if position_total > total_value + 1.0:
+        difference = position_total - total_value
+        tolerance = portable_reconciliation_tolerance(total_value)
+        if abs(difference) > tolerance:
             raise PortfolioDataError(
-                f"Pasted portfolio positions exceed account total for {label}"
+                "Pasted portfolio positions do not reconcile with account total for "
+                f"{label} (${difference:,.2f} difference exceeds ${tolerance:,.2f})"
             )
         results.append({
             "label": label,

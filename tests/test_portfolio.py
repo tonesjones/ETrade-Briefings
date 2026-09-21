@@ -29,6 +29,45 @@ class PortfolioParsingTests(unittest.TestCase):
         self.assertEqual(results[0]["holdings"][0]["lots"][0]["qty"], 5.0)
         self.assertEqual(results[1]["tax_bucket"], "roth")
 
+    def test_portable_payload_allows_small_balance_to_mark_timing_difference(self):
+        fixture = Path(__file__).parent / "fixtures" / "portable_portfolio.txt"
+        _before, raw_json = fixture.read_text(encoding="utf-8").split(
+            portfolio.PORTABLE_BEGIN, 1
+        )
+        raw_json, _after = raw_json.split(portfolio.PORTABLE_END, 1)
+        payload = json.loads(raw_json)
+        account = payload["accounts"][0]
+        account["total_value"] = 100_000.0
+        account["holdings"][1]["market_value"] = 99_505.0
+        text = (
+            f"{portfolio.PORTABLE_BEGIN}\n{json.dumps(payload)}\n"
+            f"{portfolio.PORTABLE_END}\n"
+        )
+
+        _formatted, total, _positions, _results, _as_of = (
+            portfolio.parse_portable_portfolio_text(text)
+        )
+
+        self.assertEqual(total, 100_500.0)
+
+    def test_portable_payload_rejects_material_balance_to_mark_difference(self):
+        fixture = Path(__file__).parent / "fixtures" / "portable_portfolio.txt"
+        _before, raw_json = fixture.read_text(encoding="utf-8").split(
+            portfolio.PORTABLE_BEGIN, 1
+        )
+        raw_json, _after = raw_json.split(portfolio.PORTABLE_END, 1)
+        payload = json.loads(raw_json)
+        account = payload["accounts"][0]
+        account["total_value"] = 100_000.0
+        account["holdings"][1]["market_value"] = 99_600.0
+        text = (
+            f"{portfolio.PORTABLE_BEGIN}\n{json.dumps(payload)}\n"
+            f"{portfolio.PORTABLE_END}\n"
+        )
+
+        with self.assertRaisesRegex(portfolio.PortfolioDataError, "do not reconcile"):
+            portfolio.parse_portable_portfolio_text(text)
+
     def test_legacy_human_dump_fails_closed(self):
         with self.assertRaisesRegex(portfolio.PortfolioDataError, "structured payload"):
             portfolio.parse_portable_portfolio_text("**Portfolio (live from E*TRADE)**")
