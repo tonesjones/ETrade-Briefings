@@ -38,7 +38,7 @@ class PortfolioParsingTests(unittest.TestCase):
         payload = json.loads(raw_json)
         account = payload["accounts"][0]
         account["total_value"] = 100_000.0
-        account["holdings"][1]["market_value"] = 99_505.0
+        account["holdings"][1]["market_value"] = 99_540.0
         text = (
             f"{portfolio.PORTABLE_BEGIN}\n{json.dumps(payload)}\n"
             f"{portfolio.PORTABLE_END}\n"

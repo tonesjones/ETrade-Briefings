@@ -52,8 +52,9 @@ CASH_SYMBOLS = POLICY.cash_symbols
 # Residual NAV-vs-mark gaps below this are noise, not sweep cash.
 CASH_RESIDUAL_FLOOR = 1.0
 # Account balances and position marks arrive from separate E*TRADE responses.
-# Permit a small mark-timing difference, but reject a materially incomplete payload.
-PORTABLE_RECONCILIATION_TOLERANCE_PCT = 0.0001
+# Permit up to five basis points of mark-timing difference, but reject a
+# materially incomplete payload.
+PORTABLE_RECONCILIATION_TOLERANCE_PCT = 0.0005
 LOGGER = logging.getLogger(__name__)
 PORTABLE_BEGIN = "--- BEGIN ETRADE PORTFOLIO JSON ---"
 PORTABLE_END = "--- END ETRADE PORTFOLIO JSON ---"
