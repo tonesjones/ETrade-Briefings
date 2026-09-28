@@ -1,6 +1,8 @@
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -313,6 +315,7 @@ class BriefingPolicyTests(unittest.TestCase):
                 ),
                 patch.object(briefing, "copy_to_clipboard", return_value=True),
                 patch.object(portfolio, "PROJECT_ROOT", root),
+                redirect_stdout(io.StringIO()),
             ):
                 exit_code = briefing.main(["--input-file", str(fixture)])
             self.assertEqual(exit_code, 0)
@@ -337,6 +340,7 @@ class BriefingPolicyTests(unittest.TestCase):
                     "fetch_portfolio_block",
                     side_effect=AssertionError("network path used"),
                 ),
+                redirect_stdout(io.StringIO()),
             ):
                 with self.assertRaises(portfolio.PortfolioDataError):
                     briefing.main(["--input-file", str(source)])

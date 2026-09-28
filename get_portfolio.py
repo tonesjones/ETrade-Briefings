@@ -379,6 +379,18 @@ def _is_auth_failure(exc: Exception) -> bool:
     return _status_code(exc) == 401
 
 
+def _describe_error(exc: Exception) -> str:
+    """Name the failure even when the exception carries no message text."""
+    parts = [type(exc).__name__]
+    status = _status_code(exc)
+    if status is not None:
+        parts.append(f"HTTP {status}")
+    text = str(exc).strip()
+    if text:
+        parts.append(text)
+    return " — ".join(parts)
+
+
 def _retry_read(call, attempts: int = 3):
     for attempt in range(1, attempts + 1):
         try:
@@ -388,7 +400,9 @@ def _retry_read(call, attempts: int = 3):
                 raise AuthExpiredError(str(exc)) from exc
             if not _is_transient(exc) or attempt == attempts:
                 raise
-            LOGGER.warning("Transient E*TRADE read failed (%s/%s): %s", attempt, attempts, exc)
+            LOGGER.warning(
+                "Transient E*TRADE read failed (%s/%s): %s", attempt, attempts, _describe_error(exc)
+            )
             time.sleep(0.25 * (2 ** (attempt - 1)))
 
 

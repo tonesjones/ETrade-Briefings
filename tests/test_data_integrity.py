@@ -134,8 +134,11 @@ class RetryTests(unittest.TestCase):
                 raise _http_error(503)
             return "ok"
 
-        self.assertEqual(portfolio._retry_read(flaky), "ok")
+        with self.assertLogs(portfolio.LOGGER, "WARNING") as logs:
+            self.assertEqual(portfolio._retry_read(flaky), "ok")
         self.assertEqual(len(calls), 3)
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("HTTPError — HTTP 503", logs.output[0])
 
     def test_401_becomes_reauth_message(self):
         def expired():
