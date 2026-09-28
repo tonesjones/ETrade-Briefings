@@ -8,7 +8,8 @@
     "marginal_tax_rate": "UNKNOWN",
     "external_assets_liabilities": "UNKNOWN",
     "hard_loss_limit": "UNKNOWN",
-    "hard_position_limit": "UNKNOWN"
+    "hard_position_limit": "UNKNOWN",
+    "wash_sale_scope": "Spouse accounts holding the same securities? Dividend reinvestment on or off? Anything else to check before a loss sale."
   },
   "research": {
     "EXAMPLE": {
@@ -18,7 +19,9 @@
       "valuation_or_entry": "Metric, period, current mark/session, and entry condition",
       "decision_trigger": "Specific observable condition",
       "key_metrics": "Metric names, values, periods, and definitions",
-      "sources": ["Primary source URL or filing reference with publication date"],
+      "sources": [
+        "Primary source URL or filing reference with publication date"
+      ],
       "missing_information": "What would change the conclusion"
     }
   },

@@ -100,6 +100,7 @@ def format_owner_profile(context: dict) -> str:
         ("External assets / liabilities", "external_assets_liabilities"),
         ("Hard loss limit", "hard_loss_limit"),
         ("Hard position limit", "hard_position_limit"),
+        ("Wash-sale scope", "wash_sale_scope"),
     ]
     return "\n".join(
         f"- **{label}:** {profile.get(key) or 'UNKNOWN'}" for label, key in fields
