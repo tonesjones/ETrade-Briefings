@@ -86,7 +86,7 @@ Cite every fact with its source and publication date, and prefer company release
 
 **1. Material changes.** At most three, from the data above or your research. Write **No material change** if there are none.
 
-**2. Action table.** One row per focus name: **Ticker, Fundamental View, Action, Reason, Evidence (source, date), Trigger**.
+**2. Action table.** One row per focus name: **Ticker, Fundamental View, Action, Reason, Evidence (source, date), Valuation (metric and whether it still pays for the risk), Trigger**.
 
 **3. Candidates.** {candidate_output}
 
