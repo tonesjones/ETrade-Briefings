@@ -203,10 +203,53 @@ class PolicySwapTests(unittest.TestCase):
             text = briefing.format_constraint_math(
                 [{"symbol": "A", "market_value": 50.0, "weight": 5.0}], 1000.0, 0.0
             )
-            self.assertIn("1%", text)
+            # $50 of a $1,000 book under a 1% cap → minimum cut $40.
+            self.assertIn("$40", text)
+            self.assertIn("restore 1%", text)
             self.assertIs(portfolio_policy.POLICY, tighter)
         finally:
             portfolio_policy.set_active_policy(previous)
+
+
+class LiveFetchWiringTests(unittest.TestCase):
+    """The live fetch must actually run the lot and reconciliation checks."""
+
+    accounts = {"AccountListResponse": {"Accounts": {"Account": {
+        "accountIdKey": "key", "accountStatus": "ACTIVE", "accountType": "INDIVIDUAL",
+    }}}}
+
+    def _fetch(self, position, total):
+        balance = {"BalanceResponse": {"Computed": {
+            "RealTimeValues": {"totalAccountValue": total}, "cashBalance": 0.0,
+        }}}
+        with (
+            patch(
+                "get_portfolio.get_accounts_api",
+                return_value=(object(), {"account_id_key": None}),
+            ),
+            patch("get_portfolio.list_accounts", return_value=self.accounts),
+            patch("get_portfolio.get_portfolio", return_value=_page([position])),
+            patch("get_portfolio.get_account_balance", return_value=balance),
+        ):
+            return portfolio.fetch_portfolio_block(verbose=False)
+
+    def test_matching_lots_and_totals_pass(self):
+        position = {**_position("AMD", qty=10, value=1000.0),
+                    "PositionLot": [{"remainingQty": 10, "marketValue": 1000.0, "termCode": 1}]}
+        _text, total, *_ = self._fetch(position, 1000.0)
+        self.assertEqual(total, 1000.0)
+
+    def test_lot_mismatch_stops_the_run(self):
+        position = {**_position("AMD", qty=10, value=1000.0),
+                    "PositionLot": [{"remainingQty": 7, "marketValue": 700.0, "termCode": 1}]}
+        with self.assertRaisesRegex(portfolio.IncompletePortfolioError, "AMD"):
+            self._fetch(position, 1000.0)
+
+    def test_missing_positions_stop_the_run(self):
+        position = {**_position("AMD", qty=10, value=1000.0),
+                    "PositionLot": [{"remainingQty": 10, "marketValue": 1000.0, "termCode": 1}]}
+        with self.assertRaisesRegex(portfolio.IncompletePortfolioError, "do not reconcile"):
+            self._fetch(position, 5000.0)
 
 
 if __name__ == "__main__":

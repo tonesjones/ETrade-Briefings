@@ -1373,9 +1373,9 @@ def fetch_portfolio_block(verbose: bool = True, allow_partial: bool = False):
 
     failures = [r for r in results if r.get("error")]
     if failures and not allow_partial:
-        labels = ", ".join(r["label"] for r in failures)
+        reasons = "; ".join(f"{r['label']}: {r['error']}" for r in failures)
         raise IncompletePortfolioError(
-            f"Portfolio generation stopped: incomplete account data for {labels}. "
+            f"Portfolio generation stopped: incomplete account data ({reasons}). "
             "Use --allow-partial only if you accept incorrect weights."
         )
     formatted, grand_total, total_positions = format_all_for_briefing(results, as_of=as_of)
