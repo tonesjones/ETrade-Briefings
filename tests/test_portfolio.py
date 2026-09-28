@@ -889,6 +889,32 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertIn("**Monitor only**", block)
         self.assertIn("VOO", block.split("**Monitor only**")[1])
 
+    def test_routine_day_keeps_material_losses_and_near_limit_names_in_focus(self):
+        as_of = datetime(2026, 9, 18, 16, 0, tzinfo=ET)
+        cap = POLICY.single_name_cap_pct
+        near = consolidated("MU", 14_500.0, cap - 0.5)
+        loser = consolidated(
+            "ETHA", 10_000.0, 10.0, total_gain=-6_000.0, total_gain_pct=-37.5,
+            taxable_mv=0.0, ira_mv=10_000.0,
+        )
+        steady = consolidated("VOO", 10_000.0, 10.0)
+        holdings = [near, loser, steady]
+        snap = briefing.snapshot_dict(
+            holdings,
+            {"grand_total": 100_000.0, "cluster_w": 0.0, "broad_w": 0.0,
+             "cash_w": 0.0, "top5_w": 34.5, "breaches": []},
+            as_of,
+        )
+        observation = {"positions": [], "reviews": []}
+        policy = briefing.briefing_output_policy(
+            holdings, [], [], snap, snap, observation, observation, as_of
+        )
+        self.assertEqual(policy.mode, "ROUTINE DAY")
+        reasons = dict(policy.focus_reasons)
+        self.assertIn(f"within 1 pp of {cap:g}% single-name limit", reasons["MU"])
+        self.assertIn("material loss (-38%)", reasons["ETHA"])
+        self.assertEqual(policy.monitor_symbols, ("VOO",))
+
     def test_lot_table_covers_ira_and_skips_cash(self):
         as_of = datetime(2026, 8, 12, tzinfo=ET)
         table = portfolio.format_lot_table(

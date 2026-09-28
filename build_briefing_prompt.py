@@ -534,16 +534,12 @@ def must_analyze_holdings(
     return out
 
 
-def _analyze_reason_text(row: dict) -> list[str]:
-    reasons = []
-    if "weight" in row["analyze_reasons"]:
-        reasons.append(f"weight ≥ {active_policy().analyze_weight_floor_pct:g}%")
-    if "loss" in row["analyze_reasons"]:
-        tgp, tg = row.get("total_gain_pct"), row.get("total_gain")
-        reasons.append(
-            f"material loss ({tgp:+.0f}%)" if tgp is not None else f"material loss ({fmt_money(tg)})"
-        )
-    return reasons
+NEAR_LIMIT_PP = 1.0
+
+
+def _loss_reason_text(row: dict) -> str:
+    tgp, tg = row.get("total_gain_pct"), row.get("total_gain")
+    return f"material loss ({tgp:+.0f}%)" if tgp is not None else f"material loss ({fmt_money(tg)})"
 
 
 def format_focus_block(output_policy: BriefingOutputPolicy) -> str:
@@ -605,9 +601,17 @@ def briefing_output_policy(
         reasons[symbol].append("weight moved ≥ 0.5 pp since last snapshot")
     for symbol in sorted(observation_changes):
         reasons[symbol].append("quantity or lot change since last snapshot")
-    if decision_day:
-        for row in required:
-            reasons[row["symbol"]].extend(_analyze_reason_text(row))
+    for h in holdings:
+        if not is_cash_symbol(h["symbol"]) and cap - NEAR_LIMIT_PP <= h["weight"] <= cap:
+            reasons[h["symbol"]].append(f"within {NEAR_LIMIT_PP:g} pp of {cap:g}% single-name limit")
+    # Material losses stay in focus every day: a large loss can mean a broken thesis
+    # even where there is no tax angle. Size alone earns focus only on a decision day.
+    floor = active_policy().analyze_weight_floor_pct
+    for row in required:
+        if "loss" in row["analyze_reasons"]:
+            reasons[row["symbol"]].append(_loss_reason_text(row))
+        if decision_day and "weight" in row["analyze_reasons"]:
+            reasons[row["symbol"]].append(f"weight ≥ {floor:g}%")
     # Focus follows portfolio weight so the largest positions lead.
     order = {h["symbol"]: -(h.get("market_value") or 0.0) for h in holdings}
     focus = sorted(reasons, key=lambda s: (order.get(s, 0.0), s))
@@ -934,7 +938,8 @@ def build_briefing(
     continuity_rule = (
         "**Prior proposals.** For each proposal in the decision history, mark today's as "
         "UNCHANGED / MODIFIED / REVERSED / RESOLVED. MODIFIED or REVERSED needs a dated new fact "
-        "that invalidates an earlier assumption; a fresh look or a vaguely better outlook is not enough.\n\n"
+        "that invalidates an earlier assumption; a fresh look or a vaguely better outlook is not enough. "
+        "Treat a proposal as executed only when its approval state is EXECUTED CONFIRMED.\n\n"
         if has_decision_history(context)
         else ""
     )
