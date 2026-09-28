@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Daily portfolio fetcher for the Grok briefing.
+Daily portfolio fetcher for the briefing prompt.
 Pulls live positions from E*TRADE and prints a clean block ready to paste.
 By default fetches ALL active accounts. Set ETRADE_ACCOUNT_ID_KEY to limit to one.
 
@@ -24,6 +24,7 @@ import locale
 import logging
 import os
 import subprocess
+import sys
 import time
 from argparse import ArgumentParser
 from datetime import datetime
@@ -32,9 +33,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pyetrade
+import requests
 from dotenv import load_dotenv
 
-from portfolio_policy import POLICY
+from portfolio_policy import active_policy, load_policy, set_active_policy
 
 # Explicit allow-list: only the Accounts API surface is used (list + portfolio).
 # Do not import or construct pyetrade.ETradeOrder — trading is intentionally unsupported.
@@ -43,12 +45,11 @@ _ALLOWED_PYETRADE_TYPES = (pyetrade.ETradeAccounts,)
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-try:
-    ET = ZoneInfo("America/New_York")
-except Exception:
-    ET = datetime.now().astimezone().tzinfo
+# E*TRADE's calendar (token expiry, ST/LT dates, daily snapshots) is US Eastern.
+# tzdata is a declared dependency, so a missing zone is an install error, not a
+# reason to silently fall back to the local clock.
+ET = ZoneInfo("America/New_York")
 
-CASH_SYMBOLS = POLICY.cash_symbols
 # Residual NAV-vs-mark gaps below this are noise, not sweep cash.
 CASH_RESIDUAL_FLOOR = 1.0
 # Account balances and position marks arrive from separate E*TRADE responses.
@@ -59,9 +60,27 @@ LOGGER = logging.getLogger(__name__)
 PORTABLE_BEGIN = "--- BEGIN ETRADE PORTFOLIO JSON ---"
 PORTABLE_END = "--- END ETRADE PORTFOLIO JSON ---"
 PORTABLE_SCHEMA_VERSION = 1
+PORTFOLIO_PAGE_SIZE = 50
+PORTFOLIO_MAX_PAGES = 100
+# Lot quantities may carry fractional-share rounding from E*TRADE.
+LOT_QUANTITY_TOLERANCE = 1e-4
+AUTH_ENV_KEY = "ETRADE_AUTH_DATE"
 
 class PortfolioDataError(RuntimeError):
     """The API response was incomplete or could not be validated."""
+
+
+class AuthExpiredError(PortfolioDataError):
+    """E*TRADE rejected the access token (normally the daily midnight-ET expiry)."""
+
+    def __init__(self, detail: str = ""):
+        message = (
+            "E*TRADE rejected the access token. Tokens expire at midnight US Eastern; "
+            "run `python etrade_auth.py` to re-authorize, then try again."
+        )
+        if detail:
+            message += f"\n(detail: {detail})"
+        super().__init__(message)
 
 
 class IncompletePortfolioError(PortfolioDataError):
@@ -142,6 +161,41 @@ def _parse_portable_datetime(value, field: str) -> datetime | None:
 def portable_reconciliation_tolerance(account_total: float) -> float:
     """Return the largest acceptable account-mark timing difference in dollars."""
     return max(CASH_RESIDUAL_FLOOR, account_total * PORTABLE_RECONCILIATION_TOLERANCE_PCT)
+
+
+def reconcile_account(
+    label: str, holdings: list[dict], total_value: float, *, source: str
+) -> None:
+    """Fail unless positions plus cash add up to the account's reported value.
+
+    This catches silently missing positions (for example a truncated page) that
+    would otherwise shrink every weight computed against the account total.
+    """
+    position_total = sum(h["market_value"] for h in holdings)
+    difference = position_total - total_value
+    tolerance = portable_reconciliation_tolerance(total_value)
+    if abs(difference) > tolerance:
+        raise PortfolioDataError(
+            f"{source} positions do not reconcile with account total for "
+            f"{label} (${difference:,.2f} difference exceeds ${tolerance:,.2f})"
+        )
+
+
+def check_lot_quantities(label: str, holdings: list[dict]) -> None:
+    """Fail when a holding's tax lots do not add up to its share quantity."""
+    problems = []
+    for holding in holdings:
+        lots = holding.get("lots") or []
+        quantity = holding.get("quantity") or 0.0
+        if not lots or quantity <= 0 or is_cash_symbol(holding.get("symbol") or ""):
+            continue
+        lot_total = sum(lot.get("qty") or 0.0 for lot in lots)
+        if abs(lot_total - quantity) > LOT_QUANTITY_TOLERANCE * max(1.0, quantity):
+            problems.append(f"{holding.get('symbol')} lots {lot_total:g} vs position {quantity:g}")
+    if problems:
+        raise PortfolioDataError(
+            f"Tax lots do not match position quantity for {label}: " + "; ".join(problems)
+        )
 
 
 def parse_portable_portfolio_text(text: str):
@@ -228,14 +282,8 @@ def parse_portable_portfolio_text(text: str):
                 "lots_details": None,
                 "lots": lots,
             })
-        position_total = sum(h["market_value"] for h in holdings)
-        difference = position_total - total_value
-        tolerance = portable_reconciliation_tolerance(total_value)
-        if abs(difference) > tolerance:
-            raise PortfolioDataError(
-                "Pasted portfolio positions do not reconcile with account total for "
-                f"{label} (${difference:,.2f} difference exceeds ${tolerance:,.2f})"
-            )
+        check_lot_quantities(label, holdings)
+        reconcile_account(label, holdings, total_value, source="Pasted portfolio")
         results.append({
             "label": label,
             "holdings": holdings,
@@ -307,7 +355,7 @@ def _as_float(val, default=None):
 
 def is_cash_symbol(symbol: str) -> bool:
     normalized = (symbol or "").upper()
-    return normalized in CASH_SYMBOLS or "GOVERNMENT" in normalized
+    return normalized in active_policy().cash_symbols or "GOVERNMENT" in normalized
 
 
 def now_et() -> datetime:
@@ -319,14 +367,26 @@ def _status_code(exc: Exception) -> int | None:
     return getattr(getattr(exc, "response", None), "status_code", None)
 
 
+def _is_transient(exc: Exception) -> bool:
+    """Only network failures, throttling, and server errors are worth retrying."""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    status = _status_code(exc)
+    return status == 429 or (status is not None and status >= 500)
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    return _status_code(exc) == 401
+
+
 def _retry_read(call, attempts: int = 3):
     for attempt in range(1, attempts + 1):
         try:
             return call()
         except Exception as exc:
-            status = _status_code(exc)
-            transient = status is None or status == 429 or (status is not None and status >= 500)
-            if not transient or attempt == attempts:
+            if _is_auth_failure(exc):
+                raise AuthExpiredError(str(exc)) from exc
+            if not _is_transient(exc) or attempt == attempts:
                 raise
             LOGGER.warning("Transient E*TRADE read failed (%s/%s): %s", attempt, attempts, exc)
             time.sleep(0.25 * (2 ** (attempt - 1)))
@@ -500,6 +560,8 @@ def attach_lots(accounts_api, holdings, verbose: bool = False, strict: bool = Tr
     for h in pending:
         try:
             h["lots"] = fetch_position_lots(accounts_api, h["lots_details"])
+        except AuthExpiredError:
+            raise
         except Exception as exc:
             failures.append(f"{h.get('symbol')}: {exc}")
             if verbose:
@@ -774,15 +836,15 @@ def collect_tax_flags(results, as_of: datetime) -> list[str]:
             if h.get("total_cost") in (None, 0) and not h.get("price_paid"):
                 missing.append(name)
                 continue
-            st_flag = POLICY.st_gain_flag_dollars
-            lt_flag = POLICY.lt_gain_flag_dollars
+            st_flag = active_policy().st_gain_flag_dollars
+            lt_flag = active_policy().lt_gain_flag_dollars
             if split["st_gain"] > st_flag or (
                 split["term"] == "ST" and tg is not None and tg > st_flag
             ):
                 st_gains.append(
                     f"{name} {fmt_signed_money(split['st_gain'] or (tg or 0))} ST"
                 )
-            if tg is not None and tg < POLICY.harvest_loss_dollars:
+            if tg is not None and tg < active_policy().harvest_loss_dollars:
                 losses.append(f"{name} {fmt_signed_money(tg)}")
             if split["lt_gain"] > lt_flag or (
                 split["term"] == "LT" and tg is not None and tg > lt_flag
@@ -833,9 +895,25 @@ def _credentials():
     }
 
 
+def check_auth_date(today: datetime | None = None) -> None:
+    """Fail fast when .env records tokens authorized on an earlier ET day.
+
+    Tokens always expire at midnight US Eastern, so a stale date means the API
+    would reject them; say so before making any request. A missing date (older
+    .env files) is not an error.
+    """
+    recorded = (os.getenv(AUTH_ENV_KEY) or "").strip()
+    if not recorded:
+        return
+    today_str = (today or now_et()).strftime("%Y-%m-%d")
+    if recorded != today_str:
+        raise AuthExpiredError(f"tokens were authorized on {recorded} (ET); today is {today_str}")
+
+
 def get_accounts_api():
     """Return a READ-ONLY accounts client (list + portfolio only)."""
     c = _credentials()
+    check_auth_date()
     client = pyetrade.ETradeAccounts(
         c["consumer_key"],
         c["consumer_secret"],
@@ -980,26 +1058,78 @@ def parse_account_list(resp):
     return accounts
 
 
-def get_portfolio(account_id_key: str, accounts_api=None, lots_required: bool = True):
-    """READ: portfolio positions for one account. Never places orders."""
-    if accounts_api is None:
-        accounts_api, _ = get_accounts_api()
+def _portfolio_page(accounts_api, account_id_key: str, page: int, lots_required: bool):
     kwargs = dict(
-        count=100,
+        count=PORTFOLIO_PAGE_SIZE,
+        page_number=page,
         totals_required=True,
         view="COMPLETE",
         lots_required=lots_required,
         resp_format="json",
     )
+    return _retry_read(lambda: accounts_api.get_account_portfolio(account_id_key, **kwargs))
+
+
+def _page_positions(response) -> tuple[list, dict]:
     try:
-        return _retry_read(lambda: accounts_api.get_account_portfolio(account_id_key, **kwargs))
-    except Exception:
-        if not lots_required:
-            raise
-        # COMPLETE+lots view may be retried without lots_required.
+        portfolios = response["PortfolioResponse"]["AccountPortfolio"]
+        if isinstance(portfolios, dict):
+            portfolios = [portfolios]
+        account_portfolio = portfolios[0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise PortfolioDataError("Unrecognized portfolio response") from exc
+    positions = account_portfolio.get("Position", [])
+    if isinstance(positions, dict):
+        positions = [positions]
+    if not isinstance(positions, list):
+        raise PortfolioDataError("Unrecognized portfolio response")
+    return positions, account_portfolio
+
+
+def get_portfolio(account_id_key: str, accounts_api=None, lots_required: bool = True):
+    """READ: every portfolio position for one account, across all pages.
+
+    Returns a single response shaped like E*TRADE's, with all pages' positions
+    merged. Never places orders.
+    """
+    if accounts_api is None:
+        accounts_api, _ = get_accounts_api()
+    try:
+        first = _portfolio_page(accounts_api, account_id_key, 1, lots_required)
+    except requests.HTTPError as exc:
+        # Some accounts reject COMPLETE+lots; retry once without inline lots.
         # Per-position lot fetches in attach_lots(..., strict=True) remain required.
-        kwargs["lots_required"] = False
-        return _retry_read(lambda: accounts_api.get_account_portfolio(account_id_key, **kwargs))
+        if not lots_required or _status_code(exc) not in (400, 500):
+            raise
+        lots_required = False
+        first = _portfolio_page(accounts_api, account_id_key, 1, lots_required)
+
+    positions, account_portfolio = _page_positions(first)
+    total_pages = _as_float(_first(account_portfolio, "totalPages"), default=None)
+    page = 1
+    last_count = len(positions)
+    while True:
+        if total_pages is not None:
+            more = page < int(total_pages)
+        else:
+            # Without a page count, a full page means there may be another.
+            more = last_count >= PORTFOLIO_PAGE_SIZE
+        if not more:
+            break
+        page += 1
+        if page > PORTFOLIO_MAX_PAGES:
+            raise PortfolioDataError("Portfolio paging did not terminate")
+        next_positions, _ = _page_positions(
+            _portfolio_page(accounts_api, account_id_key, page, lots_required)
+        )
+        if not next_positions:
+            break
+        positions.extend(next_positions)
+        last_count = len(next_positions)
+
+    account_portfolio["Position"] = positions
+    first["PortfolioResponse"]["AccountPortfolio"] = [account_portfolio]
+    return first
 
 
 def extract_holdings(portfolio_resp):
@@ -1117,7 +1247,11 @@ def format_all_for_briefing(account_results, as_of: datetime | None = None):
     as_of = as_of or now_et()
     now = as_of.strftime("%Y-%m-%d %H:%M")
     grand_total = sum(r["total_value"] for r in account_results if not r.get("error"))
-    total_positions = sum(sum(1 for h in r["holdings"] if h.get("symbol") != "CASH") for r in account_results if not r.get("error"))
+    total_positions = sum(
+        sum(1 for h in r["holdings"] if h.get("symbol") != "CASH")
+        for r in account_results
+        if not r.get("error")
+    )
 
     lines = []
     zone = as_of.tzname() or "ET"
@@ -1158,12 +1292,10 @@ def format_all_for_briefing(account_results, as_of: datetime | None = None):
 
 def select_accounts(all_accts, account_id_key=None):
     """
-    If ETRADE_ACCOUNT_ID_KEY is set, use only that account.
-    Otherwise use all ACTIVE accounts.
+    If an account key is given (ETRADE_ACCOUNT_ID_KEY), use only that account.
+    Otherwise use all ACTIVE accounts. Callers pass the key in; this function
+    never reads the environment.
     """
-    if account_id_key is None:
-        account_id_key = _credentials()["account_id_key"]
-
     if account_id_key:
         matched = [a for a in all_accts if a.get("accountIdKey") == account_id_key]
         if not matched:
@@ -1208,6 +1340,7 @@ def fetch_portfolio_block(verbose: bool = True, allow_partial: bool = False):
             raw = get_portfolio(key, accounts_api)
             holdings, position_total = extract_holdings(raw)
             attach_lots(accounts_api, holdings, verbose=verbose, strict=True)
+            check_lot_quantities(label, holdings)
             balance_raw = get_account_balance(key, a.get("accountType") or "", accounts_api)
             total = parse_account_balance(balance_raw)
             apply_cash_lot(
@@ -1216,6 +1349,7 @@ def fetch_portfolio_block(verbose: bool = True, allow_partial: bool = False):
                 position_total=position_total,
                 cash_from_balance=parse_account_cash(balance_raw),
             )
+            reconcile_account(label, holdings, total, source="Live portfolio")
             results.append({
                 "label": label,
                 "holdings": holdings,
@@ -1224,6 +1358,8 @@ def fetch_portfolio_block(verbose: bool = True, allow_partial: bool = False):
                 "tax_bucket": tax_bucket_from_account(a),
                 "account_type": a.get("accountType"),
             })
+        except AuthExpiredError:
+            raise
         except Exception as e:
             results.append({
                 "label": label,
@@ -1238,7 +1374,10 @@ def fetch_portfolio_block(verbose: bool = True, allow_partial: bool = False):
     failures = [r for r in results if r.get("error")]
     if failures and not allow_partial:
         labels = ", ".join(r["label"] for r in failures)
-        raise IncompletePortfolioError(f"Portfolio generation stopped: incomplete account data for {labels}. Use --allow-partial only if you accept incorrect weights.")
+        raise IncompletePortfolioError(
+            f"Portfolio generation stopped: incomplete account data for {labels}. "
+            "Use --allow-partial only if you accept incorrect weights."
+        )
     formatted, grand_total, total_positions = format_all_for_briefing(results, as_of=as_of)
     if failures:
         formatted = "**INCOMPLETE DATA — do not use for trade sizing.**\n\n" + formatted
@@ -1288,11 +1427,22 @@ def main(argv=None) -> int:
         action="store_true",
         help="Generate an unsafe, prominently marked result if an account fails.",
     )
-    args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    formatted, grand_total, total_positions, _results, as_of = fetch_portfolio_block(
-        allow_partial=args.allow_partial
+    parser.add_argument(
+        "--policy",
+        type=Path,
+        help="Use this decision-policy JSON instead of portfolio_policy.json.",
     )
+    args = parser.parse_args(argv)
+    if args.policy:
+        set_active_policy(load_policy(args.policy))
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    try:
+        formatted, grand_total, total_positions, _results, as_of = fetch_portfolio_block(
+            allow_partial=args.allow_partial
+        )
+    except AuthExpiredError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 2
     portable = format_portable_portfolio_text(formatted, _results, as_of)
     path = save_portfolio_block(portable, as_of=as_of)
     clipped = copy_to_clipboard(portable)
@@ -1307,7 +1457,7 @@ def main(argv=None) -> int:
     else:
         print(f"Clipboard: could not copy automatically — use --input-file {path}")
     print("-" * 50)
-    print("\nNext: open grok.com → paste into your Daily Portfolio Action Briefing prompt.")
+    print("\nNext: run briefing.cmd to build the prompt from the clipboard payload.")
     return 0
 
 

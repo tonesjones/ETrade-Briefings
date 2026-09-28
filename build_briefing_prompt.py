@@ -10,16 +10,30 @@ budget → thesis/valuation → tax/lot → opportunity cost), not a stock check
 from __future__ import annotations
 
 import json
-import re
 import sys
 from argparse import ArgumentParser
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from hashlib import sha256
 from pathlib import Path
 
+from briefing_formatting import fmt_money, fmt_weight
+from briefing_snapshots import (  # noqa: F401 - re-exported for callers and tests
+    _changed_observation_symbols,
+    _changed_weight_symbols,
+    _snapshot_coverage,
+    format_daily_delta,
+    format_observed_delta,
+    load_prior_observation,
+    load_prior_snapshot,
+    observation_snapshot_dict,
+    parse_snapshot_from_prompt,
+    save_observation_snapshot,
+    save_weights_snapshot,
+    snapshot_dict,
+)
 from get_portfolio import (
+    AuthExpiredError,
     account_tail,
     atomic_write_text,
     collect_tax_flags,
@@ -31,7 +45,7 @@ from get_portfolio import (
     read_clipboard_text,
     save_portfolio_block,
 )
-from portfolio_policy import POLICY
+from portfolio_policy import active_policy, load_policy, set_active_policy
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUT_DIR = PROJECT_ROOT / "prompts"
@@ -54,22 +68,6 @@ class BriefingOutputPolicy:
     include_tax_detail: bool
 
 # User-editable decision policy (portfolio_policy.json).
-AI_SEMI_CLUSTER = POLICY.sleeves["direct_ai_semi"]
-BROAD_AI_LIQUID = POLICY.sleeves["broad_ai_cycle"]
-CRYPTO_CLUSTER = POLICY.sleeves["crypto"]
-PAYMENTS_CLUSTER = POLICY.sleeves["payments"]
-BROAD_INDEX = POLICY.sleeves["broad_index"]
-ANALYZE_WEIGHT_FLOOR = POLICY.analyze_weight_floor_pct
-ANALYZE_MV_FLOOR = POLICY.analyze_market_value_floor
-MATERIAL_LOSS_DOLLARS = POLICY.material_loss_dollars
-MATERIAL_LOSS_PCT = POLICY.material_loss_pct
-HARVEST_LOSS_DOLLARS = POLICY.harvest_loss_dollars
-RISK_OFF_GLIDE = POLICY.risk_off_glide_pct
-SINGLE_NAME_CAP = POLICY.single_name_cap_pct
-CLUSTER_NO_ADD = POLICY.cluster_do_not_increase_pct
-CLUSTER_SOFT_CAP = POLICY.cluster_soft_cap_pct
-ALIASES = POLICY.aliases
-MARGINAL_EXAMPLES = POLICY.marginal_examples
 
 
 def load_portfolio_context(path: Path = CONTEXT_PATH) -> tuple[dict, str]:
@@ -165,7 +163,7 @@ def sleeve_member_text(symbols: tuple[str, ...]) -> str:
 
 
 def broad_ai_sleeve_label() -> str:
-    extras = [s for s in BROAD_AI_LIQUID if s not in AI_SEMI_CLUSTER]
+    extras = [s for s in active_policy().sleeves["broad_ai_cycle"] if s not in active_policy().sleeves["direct_ai_semi"]]
     if extras:
         return "direct + " + " ".join(extras)
     return "direct"
@@ -265,7 +263,7 @@ def consolidate(results, grand_total: float):
                 "market_value": mv,
                 "weight": w,
                 "price": d["price"],
-                "alias": ALIASES.get(sym),
+                "alias": active_policy().aliases.get(sym),
                 "quantity": qty,
                 "cost_per_share": cps,
                 "price_paid": paid,
@@ -280,16 +278,6 @@ def consolidate(results, grand_total: float):
             }
         )
     return holdings, accounts
-
-
-def fmt_money(x: float) -> str:
-    if abs(x) >= 1_000_000:
-        return f"${x / 1_000_000:.2f}M".replace(".00M", "M")
-    return f"${x:,.0f}"
-
-
-def fmt_weight(w: float) -> str:
-    return f"{w:.1f}%"
 
 
 def holding_line(h: dict, as_of) -> str:
@@ -346,9 +334,9 @@ def taxable_harvest_reviews(results) -> list[dict]:
             market_value = holding.get("market_value") or 0.0
             total_gain = holding.get("total_gain")
             if (
-                market_value >= ANALYZE_MV_FLOOR
+                market_value >= active_policy().analyze_market_value_floor
                 and total_gain is not None
-                and total_gain < HARVEST_LOSS_DOLLARS
+                and total_gain < active_policy().harvest_loss_dollars
             ):
                 reviews.append(
                     {
@@ -376,7 +364,7 @@ def format_observable_reviews(harvest_reviews: list[dict], breaches: list[dict])
         lines.append(
             f"- **{holding['symbol']} — CONCENTRATION_REVIEW:** "
             f"{fmt_weight(holding['weight'])} exceeds the "
-            f"{SINGLE_NAME_CAP:g}% soft maximum. Review only — not an approved sale."
+            f"{active_policy().single_name_cap_pct:g}% soft maximum. Review only — not an approved sale."
         )
     if not lines:
         return "- No automated TLH or single-name concentration review flags."
@@ -397,24 +385,24 @@ def must_analyze_holdings(
             continue
         reasons: list[str] = []
         mv = h.get("market_value") or 0.0
-        if (h.get("weight") or 0.0) >= ANALYZE_WEIGHT_FLOOR:
+        if (h.get("weight") or 0.0) >= active_policy().analyze_weight_floor_pct:
             reasons.append("weight")
         tg = h.get("total_gain")
         tgp = h.get("total_gain_pct")
-        sized = mv >= ANALYZE_MV_FLOOR
+        sized = mv >= active_policy().analyze_market_value_floor
         if required_harvest_symbols is not None:
             harvest_required = sym in required_harvest_symbols
         else:
             taxable_mv = h.get("taxable_mv") or 0.0
             harvest_required = (
-                sized and taxable_mv > 0 and tg is not None and tg < HARVEST_LOSS_DOLLARS
+                sized and taxable_mv > 0 and tg is not None and tg < active_policy().harvest_loss_dollars
             )
         if harvest_required:
             reasons.append("harvest")
         if (
             sized
             and tg is not None
-            and (tg <= MATERIAL_LOSS_DOLLARS or (tgp is not None and tgp <= MATERIAL_LOSS_PCT))
+            and (tg <= active_policy().material_loss_dollars or (tgp is not None and tgp <= active_policy().material_loss_pct))
         ):
             reasons.append("loss")
         if reasons:
@@ -429,7 +417,7 @@ def format_must_analyze(rows: list[dict]) -> str:
     extra = [r for r in rows if "weight" not in r["analyze_reasons"]]
     lines = []
     if weight:
-        lines.append(f"- Weight ≥ {ANALYZE_WEIGHT_FLOOR:g}%: " + ", ".join(weight))
+        lines.append(f"- Weight ≥ {active_policy().analyze_weight_floor_pct:g}%: " + ", ".join(weight))
     if extra:
         bits = []
         for row in extra:
@@ -444,73 +432,6 @@ def format_must_analyze(rows: list[dict]) -> str:
     if not lines:
         return "- None"
     return "\n".join(lines)
-
-
-def _position_key(row: dict) -> tuple[str, str]:
-    return str(row.get("account_ref") or ""), str(row.get("symbol") or "")
-
-
-def _lot_identity(row: dict) -> list[tuple]:
-    return [
-        (
-            lot.get("acquired"),
-            round(float(lot.get("quantity") or 0.0), 8),
-            round(float(lot.get("total_cost") or 0.0), 2),
-        )
-        for lot in row.get("lots") or []
-    ]
-
-
-def _changed_weight_symbols(today_snap: dict, prior_snap: dict | None) -> set[str]:
-    if not prior_snap:
-        return set()
-    previous = {row["symbol"]: row for row in prior_snap.get("holdings") or []}
-    current = {row["symbol"]: row for row in today_snap.get("holdings") or []}
-    changed = set()
-    for symbol in set(previous) | set(current):
-        if is_cash_symbol(symbol):
-            continue
-        old = previous.get(symbol)
-        new = current.get(symbol)
-        if old is None or new is None:
-            changed.add(symbol)
-            continue
-        if abs((new.get("weight") or 0.0) - (old.get("weight") or 0.0)) >= 0.5:
-            changed.add(symbol)
-    return changed
-
-
-def _changed_observation_symbols(today: dict, prior: dict | None) -> set[str]:
-    if not prior:
-        return set()
-    previous = {_position_key(row): row for row in prior.get("positions") or []}
-    current = {_position_key(row): row for row in today.get("positions") or []}
-    changed = set()
-    for key in set(previous) | set(current):
-        old = previous.get(key)
-        new = current.get(key)
-        row = new or old or {}
-        symbol = row.get("symbol") or ""
-        if not symbol or is_cash_symbol(symbol):
-            continue
-        if old is None or new is None:
-            changed.add(symbol)
-            continue
-        old_qty = float(old.get("quantity") or 0.0)
-        new_qty = float(new.get("quantity") or 0.0)
-        tolerance = max(1e-6, abs(old_qty) * 1e-8)
-        if abs(new_qty - old_qty) > tolerance or _lot_identity(old) != _lot_identity(new):
-            changed.add(symbol)
-    previous_reviews = {
-        (row.get("kind"), row.get("symbol"), row.get("account"))
-        for row in prior.get("reviews") or []
-    }
-    current_reviews = {
-        (row.get("kind"), row.get("symbol"), row.get("account"))
-        for row in today.get("reviews") or []
-    }
-    changed.update(row[1] for row in previous_reviews ^ current_reviews if row[1])
-    return changed
 
 
 def briefing_output_policy(
@@ -569,425 +490,24 @@ def min_cut_to_cap(mv: float, total: float, cap_pct: float) -> float:
     return max(0.0, mv - total * cap_pct / 100.0)
 
 
-def snapshot_dict(holdings, metrics: dict, as_of: datetime) -> dict:
-    return {
-        "schema_version": 1,
-        "as_of": as_of.isoformat(),
-        "date": as_of.strftime("%Y-%m-%d"),
-        "grand_total": metrics["grand_total"],
-        "cluster_w": metrics["cluster_w"],
-        "broad_w": metrics["broad_w"],
-        "cash_w": metrics["cash_w"],
-        "top5_w": metrics["top5_w"],
-        "breaches": metrics.get("breaches") or [],
-        "holdings": [
-            {
-                "symbol": h["symbol"],
-                "weight": h["weight"],
-                "market_value": h["market_value"],
-                "price": h["price"],
-            }
-            for h in holdings
-            if h.get("symbol")
-        ],
-    }
-
-
-def save_weights_snapshot(snap: dict, as_of: datetime) -> Path:
-    BRIEFINGS_DIR.mkdir(exist_ok=True)
-    dated = BRIEFINGS_DIR / f"weights_{as_of.strftime('%Y-%m-%d')}.json"
-    latest = BRIEFINGS_DIR / "weights_latest.json"
-    text = json.dumps(snap, indent=2)
-    atomic_write_text(dated, text)
-    atomic_write_text(latest, text)
-    return dated
-
-
-def _account_ref(result: dict) -> str:
-    """Stable non-secret account reference for local snapshot comparisons."""
-    if result.get("account_ref"):
-        return str(result["account_ref"])
-    key = str(result.get("account_id_key") or result.get("label") or "unknown")
-    return sha256(key.encode("utf-8")).hexdigest()[:12]
-
-
-def _snapshot_date(value) -> str | None:
-    if isinstance(value, datetime):
-        return value.date().isoformat()
-    if value:
-        return str(value)
-    return None
-
-
-def observation_snapshot_dict(
-    results,
-    harvest_reviews: list[dict],
-    breaches: list[dict],
-    as_of: datetime,
-) -> dict:
-    """Build per-account position state for next-run execution reconciliation."""
-    positions = []
-    for result in results or []:
-        if result.get("error"):
-            continue
-        account_ref = _account_ref(result)
-        account = account_tail(result.get("label") or "") or "account"
-        tax_bucket = result.get("tax_bucket") or "taxable"
-        for holding in result.get("holdings") or []:
-            symbol = holding.get("symbol") or ""
-            if not symbol:
-                continue
-            lots = []
-            for lot in holding.get("lots") or []:
-                lots.append(
-                    {
-                        "quantity": lot.get("qty") or 0.0,
-                        "acquired": _snapshot_date(lot.get("acquired")),
-                        "term_code": lot.get("term_code"),
-                        "total_cost": lot.get("total_cost") or 0.0,
-                    }
-                )
-            lots.sort(
-                key=lambda lot: (
-                    lot.get("acquired") or "",
-                    lot.get("quantity") or 0.0,
-                    lot.get("total_cost") or 0.0,
-                )
-            )
-            positions.append(
-                {
-                    "account_ref": account_ref,
-                    "account": account,
-                    "tax_bucket": tax_bucket,
-                    "position_id": str(holding.get("position_id") or ""),
-                    "symbol": symbol,
-                    "quantity": holding.get("quantity") or 0.0,
-                    "price": holding.get("price") or 0.0,
-                    "market_value": holding.get("market_value") or 0.0,
-                    "total_cost": holding.get("total_cost"),
-                    "total_gain": holding.get("total_gain"),
-                    "lots": lots,
-                }
-            )
-    positions.sort(key=lambda row: (row["account_ref"], row["symbol"]))
-    reviews = [
-        {
-            "kind": "OPEN_TLH_REVIEW",
-            "symbol": row["symbol"],
-            "account": row["account"],
-        }
-        for row in harvest_reviews
-    ]
-    reviews.extend(
-        {
-            "kind": "CONCENTRATION_REVIEW",
-            "symbol": holding["symbol"],
-            "account": "consolidated",
-        }
-        for holding in breaches
-    )
-    reviews.sort(key=lambda row: (row["kind"], row["symbol"], row["account"]))
-    return {
-        "schema_version": 1,
-        "as_of": as_of.isoformat(),
-        "date": as_of.strftime("%Y-%m-%d"),
-        "positions": positions,
-        "reviews": reviews,
-    }
-
-
-def save_observation_snapshot(snap: dict, as_of: datetime) -> Path:
-    BRIEFINGS_DIR.mkdir(exist_ok=True)
-    dated = BRIEFINGS_DIR / f"observations_{as_of.strftime('%Y-%m-%d')}.json"
-    latest = BRIEFINGS_DIR / "observations_latest.json"
-    text = json.dumps(snap, indent=2)
-    atomic_write_text(dated, text)
-    atomic_write_text(latest, text)
-    return dated
-
-
-def load_prior_observation(as_of: datetime) -> tuple[dict | None, str]:
-    today = as_of.strftime("%Y-%m-%d")
-    paths = sorted(BRIEFINGS_DIR.glob("observations_20*.json"), reverse=True)
-    for path in paths:
-        if today in path.name:
-            continue
-        try:
-            return json.loads(path.read_text(encoding="utf-8")), path.name
-        except (OSError, json.JSONDecodeError):
-            continue
-    return None, ""
-
-
-def format_observed_delta(today: dict, prior: dict | None, prior_label: str) -> str:
-    """Describe observable position changes without inferring user intent."""
-    if not prior:
-        return (
-            "- No prior observation snapshot yet. Quantity/lot account-change "
-            "reconciliation begins on the next run."
-        )
-
-    label = prior.get("date") or prior.get("as_of") or prior_label
-    lines = [f"Compared with **{label}** (`{prior_label}`):"]
-    previous = {_position_key(row): row for row in prior.get("positions") or []}
-    current = {_position_key(row): row for row in today.get("positions") or []}
-    events = []
-    for key in sorted(set(previous) | set(current)):
-        old = previous.get(key)
-        new = current.get(key)
-        row = new or old or {}
-        symbol = row.get("symbol") or "?"
-        account = row.get("account") or "account"
-        if is_cash_symbol(symbol):
-            continue
-        if old is None:
-            events.append(
-                f"- **POSITION_APPEARED:** {symbol} / {account}, "
-                f"qty {float(new.get('quantity') or 0.0):,.4g}. Possible buy, "
-                "transfer, or corporate action; execution is not confirmed."
-            )
-            continue
-        if new is None:
-            events.append(
-                f"- **POSITION_DISAPPEARED:** {symbol} / {account}, prior qty "
-                f"{float(old.get('quantity') or 0.0):,.4g}. Possible full sale, "
-                "transfer, or corporate action; execution is not confirmed."
-            )
-            continue
-        old_qty = float(old.get("quantity") or 0.0)
-        new_qty = float(new.get("quantity") or 0.0)
-        tolerance = max(1e-6, abs(old_qty) * 1e-8)
-        if new_qty > old_qty + tolerance:
-            events.append(
-                f"- **QUANTITY_INCREASE:** {symbol} / {account}, "
-                f"qty {old_qty:,.4g} → {new_qty:,.4g}. Possible buy, transfer, "
-                "or corporate action; execution is not confirmed."
-            )
-        elif new_qty < old_qty - tolerance:
-            events.append(
-                f"- **QUANTITY_DECREASE:** {symbol} / {account}, "
-                f"qty {old_qty:,.4g} → {new_qty:,.4g}. Possible sale, transfer, "
-                "or corporate action; execution is not confirmed."
-            )
-        elif _lot_identity(old) != _lot_identity(new):
-            events.append(
-                f"- **LOT_IDENTITY_CHANGE:** {symbol} / {account} with unchanged "
-                "net quantity. Treat as review-required, not a confirmed trade."
-            )
-    if events:
-        lines.extend(events)
-    else:
-        lines.append(
-            "- No quantity or lot-identity change detected. This means **NO "
-            "EXECUTION DETECTED**; it does not establish approval, rejection, or intent."
-        )
-
-    prior_reviews = {
-        (row.get("kind"), row.get("symbol"), row.get("account"))
-        for row in prior.get("reviews") or []
-    }
-    today_reviews = {
-        (row.get("kind"), row.get("symbol"), row.get("account"))
-        for row in today.get("reviews") or []
-    }
-    for kind, symbol, account in sorted(today_reviews - prior_reviews):
-        lines.append(f"- **Review opened:** {symbol} / {account} — {kind}.")
-    for kind, symbol, account in sorted(prior_reviews - today_reviews):
-        lines.append(
-            f"- **Review cleared by observable data:** {symbol} / {account} — "
-            f"{kind}. Do not infer why."
-        )
-    return "\n".join(lines)
-
-
-_HOLDING_LINE_RE = re.compile(
-    r"^- ([A-Z][A-Z0-9.]*)(?: \([^)]+\))? ([\d.]+)%\s+"
-    r"\(\$?([0-9,.]+(?:M)?) @ \$([\d.]+)"
-)
-
-
-def _parse_money_token(s: str) -> float:
-    s = s.replace(",", "")
-    if s.endswith("M"):
-        return float(s[:-1]) * 1_000_000
-    return float(s)
-
-
-def parse_snapshot_from_prompt(text: str) -> dict | None:
-    holdings = []
-    in_holdings = False
-    for line in text.splitlines():
-        if line.startswith("**Consolidated holdings"):
-            in_holdings = True
-            continue
-        if in_holdings:
-            if line.startswith("**") or line.startswith("# "):
-                break
-            m = _HOLDING_LINE_RE.match(line)
-            if m:
-                holdings.append(
-                    {
-                        "symbol": m.group(1),
-                        "weight": float(m.group(2)),
-                        "market_value": _parse_money_token(m.group(3)),
-                        "price": float(m.group(4)),
-                    }
-                )
-    if not holdings:
-        return None
-
-    def _pct(patterns) -> float | None:
-        for pat in patterns:
-            m = re.search(pat, text)
-            if m:
-                return float(m.group(1))
-        return None
-
-    cluster_w = _pct(
-        [
-            r"Direct AI/semi[^\n]*?\*\*([\d.]+)%\*\*",
-            r"pure AI/semi cluster[^\n]*?([\d.]+)%",
-        ]
-    )
-    broad_w = _pct([r"Broad AI-cycle liquid[^\n]*?\*\*([\d.]+)%\*\*"])
-    cash_w = _pct(
-        [
-            r"Cash \+ cash equivalents:[^\n]*?\(([\d.]+)%\)",
-            r"Cash \+ cash equivalents[^\n]*?\(([\d.]+)%\)",
-            r"Cash \(SGOV\):[^\n]*?\(([\d.]+)%\)",
-            r"Cash \(SGOV\)[^\n]*?~([\d.]+)%",
-        ]
-    )
-    top5_w = _pct([r"Top-5[^\n]*?([\d.]+)%"])
-    return {
-        "as_of": "prior briefing",
-        "date": "",
-        "cluster_w": cluster_w,
-        "broad_w": broad_w,
-        "cash_w": cash_w,
-        "top5_w": top5_w,
-        "holdings": holdings,
-        "breaches": [
-            h["symbol"]
-            for h in holdings
-            if h["weight"] > SINGLE_NAME_CAP and not is_cash_symbol(h["symbol"])
-        ],
-    }
-
-
-def load_prior_snapshot(as_of: datetime) -> tuple[dict | None, str]:
-    today = as_of.strftime("%Y-%m-%d")
-    json_files = sorted(BRIEFINGS_DIR.glob("weights_20*.json"), reverse=True)
-    for path in json_files:
-        if today in path.name:
-            continue
-        try:
-            return json.loads(path.read_text(encoding="utf-8")), path.name
-        except (OSError, json.JSONDecodeError):
-            continue
-
-    prompt_files = sorted(OUT_DIR.glob("daily_briefing_prompt_20*.md"), reverse=True)
-    for path in prompt_files:
-        if today in path.name:
-            continue
-        try:
-            parsed = parse_snapshot_from_prompt(path.read_text(encoding="utf-8"))
-        except OSError:
-            continue
-        if parsed:
-            parsed["date"] = path.stem.replace("daily_briefing_prompt_", "")
-            parsed["as_of"] = parsed["date"]
-            return parsed, path.name
-    return None, ""
-
-
-def format_daily_delta(today_snap: dict, prior: dict | None, prior_label: str) -> str:
-    if not prior:
-        return (
-            "_No prior snapshot yet. Tomorrow’s run will show weight/limit "
-            "deltas. Unchanged analysis should not be repeated._"
-        )
-    label = prior.get("date") or prior.get("as_of") or prior_label
-    lines = [f"Compared with **{label}** (`{prior_label}`). Only material moves:"]
-
-    prior_h = {h["symbol"]: h for h in prior.get("holdings") or []}
-    today_h = {h["symbol"]: h for h in today_snap.get("holdings") or []}
-    material = []
-    for sym in sorted(set(prior_h) | set(today_h)):
-        if is_cash_symbol(sym):
-            continue
-        pw = (prior_h.get(sym) or {}).get("weight")
-        tw = (today_h.get(sym) or {}).get("weight")
-        if pw is None:
-            material.append(f"- **{sym}** new today at {fmt_weight(tw)}")
-        elif tw is None:
-            material.append(f"- **{sym}** exited (was {fmt_weight(pw)})")
-        elif abs(tw - pw) >= 0.5:
-            sign = "+" if tw > pw else ""
-            material.append(
-                f"- **{sym}** {fmt_weight(pw)} → {fmt_weight(tw)} ({sign}{tw - pw:.1f} pp)"
-            )
-    if material:
-        lines.extend(material)
-    else:
-        lines.append("- No single-name weight change ≥ 0.5 pp.")
-
-    def _metric(key, title):
-        a, b = prior.get(key), today_snap.get(key)
-        if a is None or b is None:
-            return None
-        if abs(b - a) < 0.15:
-            return None
-        sign = "+" if b > a else ""
-        return f"- {title}: {a:.1f}% → {b:.1f}% ({sign}{b - a:.1f} pp)"
-
-    for key, title in (
-        ("cluster_w", "Direct AI/semi"),
-        ("broad_w", "Broad AI-cycle liquid"),
-        ("cash_w", "Cash"),
-        ("top5_w", "Top-5"),
-    ):
-        row = _metric(key, title)
-        if row:
-            lines.append(row)
-
-    prior_br = set(prior.get("breaches") or [])
-    today_br = set(today_snap.get("breaches") or [])
-    if today_br - prior_br:
-        lines.append(
-            f"- **New {SINGLE_NAME_CAP:g}% breach:** " + ", ".join(sorted(today_br - prior_br))
-        )
-    if prior_br - today_br:
-        lines.append(
-            f"- **{SINGLE_NAME_CAP:g}% breach cleared:** " + ", ".join(sorted(prior_br - today_br))
-        )
-    if today_br and today_br == prior_br:
-        lines.append(f"- {SINGLE_NAME_CAP:g}% breach **unchanged:** " + ", ".join(sorted(today_br)))
-    lines.append(
-        "Treat these as market-move vs thesis-move in Daily Delta. "
-        "Do not repeat unchanged analysis."
-    )
-    return "\n".join(lines)
-
-
 def format_constraint_math(holdings, grand_total: float, cluster_mv: float) -> str:
     lines = []
     for h in holdings:
-        if is_cash_symbol(h["symbol"]) or h["weight"] <= SINGLE_NAME_CAP:
+        if is_cash_symbol(h["symbol"]) or h["weight"] <= active_policy().single_name_cap_pct:
             continue
-        cut = min_cut_to_cap(h["market_value"], grand_total, SINGLE_NAME_CAP)
+        cut = min_cut_to_cap(h["market_value"], grand_total, active_policy().single_name_cap_pct)
         new_w = (h["market_value"] - cut) / grand_total * 100 if grand_total else 0
         lines.append(
             f"- **{h['symbol']}** {fmt_weight(h['weight'])}: "
-            f"min **{fmt_money(cut)}** to restore {SINGLE_NAME_CAP:g}% "
+            f"min **{fmt_money(cut)}** to restore {active_policy().single_name_cap_pct:g}% "
             f"(→ {fmt_weight(new_w)}). Larger is optional."
         )
-    c40 = min_cut_to_cap(cluster_mv, grand_total, CLUSTER_SOFT_CAP)
-    c38 = min_cut_to_cap(cluster_mv, grand_total, CLUSTER_NO_ADD)
+    c40 = min_cut_to_cap(cluster_mv, grand_total, active_policy().cluster_soft_cap_pct)
+    c38 = min_cut_to_cap(cluster_mv, grand_total, active_policy().cluster_do_not_increase_pct)
     if c40 > 0:
         lines.append(
-            f"- Direct AI/semi: **{fmt_money(c40)}** to {CLUSTER_SOFT_CAP:g}%; "
-            f"**{fmt_money(c38)}** to {CLUSTER_NO_ADD:g}%. Hold-above OK if only "
+            f"- Direct AI/semi: **{fmt_money(c40)}** to {active_policy().cluster_soft_cap_pct:g}%; "
+            f"**{fmt_money(c38)}** to {active_policy().cluster_do_not_increase_pct:g}%. Hold-above OK if only "
             "lots are punitive ST; do not add."
         )
     if not lines:
@@ -1012,7 +532,7 @@ def format_marginal_10k(
         return "_Total unavailable._"
     amount = 10_000.0
     unit = amount / grand_total * 100
-    cluster_ok = cluster_mv / grand_total * 100 < CLUSTER_NO_ADD
+    cluster_ok = cluster_mv / grand_total * 100 < active_policy().cluster_do_not_increase_pct
 
     def source_from_account(account_results):
         candidates = []
@@ -1070,14 +590,14 @@ def format_marginal_10k(
         ),
         "|---|---:|---:|---:|---:|---|",
     ]
-    specs = list(MARGINAL_EXAMPLES)
+    specs = list(active_policy().marginal_examples)
     for label, sym, note in specs:
-        d_direct = unit if sym in AI_SEMI_CLUSTER else 0.0
-        d_broad = unit if sym in BROAD_AI_LIQUID else 0.0
+        d_direct = unit if sym in active_policy().sleeves["direct_ai_semi"] else 0.0
+        d_broad = unit if sym in active_policy().sleeves["broad_ai_cycle"] else 0.0
         d_top5 = top5_weight_after(sym) - current_top5_w
         extra = note
         if d_direct and not cluster_ok:
-            extra += f" — **do not add** while direct ≥ {CLUSTER_NO_ADD:g}%"
+            extra += f" — **do not add** while direct ≥ {active_policy().cluster_do_not_increase_pct:g}%"
         rows.append(row(label, d_direct, d_broad, -unit, d_top5, extra))
 
     overweight = next(
@@ -1085,16 +605,16 @@ def format_marginal_10k(
             h
             for h in holdings
             if not is_cash_symbol(h["symbol"])
-            and h["market_value"] / grand_total * 100 > SINGLE_NAME_CAP
+            and h["market_value"] / grand_total * 100 > active_policy().single_name_cap_pct
         ),
         None,
     )
     if overweight:
         symbol = overweight["symbol"]
         current_weight = overweight["market_value"] / grand_total * 100
-        cut_to_cap = min_cut_to_cap(overweight["market_value"], grand_total, SINGLE_NAME_CAP)
-        direct_delta = -unit if symbol in AI_SEMI_CLUSTER else 0.0
-        broad_delta = -unit if symbol in BROAD_AI_LIQUID else 0.0
+        cut_to_cap = min_cut_to_cap(overweight["market_value"], grand_total, active_policy().single_name_cap_pct)
+        direct_delta = -unit if symbol in active_policy().sleeves["direct_ai_semi"] else 0.0
+        broad_delta = -unit if symbol in active_policy().sleeves["broad_ai_cycle"] else 0.0
         post_sale_values = {
             h["symbol"]: h["market_value"] - (amount if h["symbol"] == symbol else 0.0)
             for h in holdings
@@ -1112,7 +632,7 @@ def format_marginal_10k(
                     f"Δ top-5 {top5_delta:+.2f}. {symbol} "
                     f"{fmt_weight(current_weight)} → "
                     f"{fmt_weight(current_weight - unit)}. "
-                    f"Minimum to restore {SINGLE_NAME_CAP:g}% is "
+                    f"Minimum to restore {active_policy().single_name_cap_pct:g}% is "
                     f"{fmt_money(cut_to_cap)}."
                 ),
             ]
@@ -1125,23 +645,17 @@ def format_marginal_10k(
     return "\n".join(rows)
 
 
-def _snapshot_coverage(as_of: datetime, prior: dict | None, prior_label: str) -> str:
-    if not prior:
-        return "No earlier snapshot is available."
-    raw_date = prior.get("date") or prior.get("as_of")
-    if not raw_date:
-        return f"Previous snapshot: {prior_label}."
-    try:
-        prior_date = datetime.fromisoformat(str(raw_date)).date()
-    except ValueError:
-        return f"Previous snapshot: {raw_date} ({prior_label})."
-    gap = (as_of.date() - prior_date).days
-    if gap > 1:
-        return (
-            f"Previous snapshot: {prior_date.isoformat()} ({gap} calendar days earlier). "
-            "No snapshots were recorded for the intervening dates; changes are cumulative."
-        )
-    return f"Previous snapshot: {prior_date.isoformat()} ({prior_label})."
+PROMPT_TEMPLATE_PATH = PROJECT_ROOT / "templates" / "briefing_prompt.md"
+
+
+def render_prompt_template(**fields) -> str:
+    """Fill the briefing prompt wording (templates/briefing_prompt.md) with values.
+
+    Edit the Markdown file to change instructions; edit this module only when a
+    new computed value is needed. Placeholders use str.format syntax.
+    """
+    template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+    return template.format(**fields)
 
 
 def build_briefing(
@@ -1152,19 +666,20 @@ def build_briefing(
     portfolio_block: str,
     results=None,
 ) -> BriefingBuildResult:
+    policy = active_policy()
     context, context_status = load_portfolio_context()
     as_of_str = as_of.strftime("%Y-%m-%d %H:%M")
-    direct_members = "+".join(AI_SEMI_CLUSTER)
-    broad_members = "+".join(BROAD_AI_LIQUID)
+    direct_members = "+".join(policy.sleeves["direct_ai_semi"])
+    broad_members = "+".join(policy.sleeves["broad_ai_cycle"])
     broad_sleeve_label = broad_ai_sleeve_label()
-    crypto_label = sleeve_member_text(CRYPTO_CLUSTER)
-    payments_label = sleeve_member_text(PAYMENTS_CLUSTER)
-    index_label = sleeve_member_text(BROAD_INDEX)
-    cluster_mv, cluster_w, _ = sleeve_stats(holdings, AI_SEMI_CLUSTER, grand_total)
-    broad_mv, broad_w, _ = sleeve_stats(holdings, BROAD_AI_LIQUID, grand_total)
-    crypto_mv, crypto_w, _ = sleeve_stats(holdings, CRYPTO_CLUSTER, grand_total)
-    pay_mv, pay_w, _ = sleeve_stats(holdings, PAYMENTS_CLUSTER, grand_total)
-    voo_mv, voo_w, _ = sleeve_stats(holdings, BROAD_INDEX, grand_total)
+    crypto_label = sleeve_member_text(policy.sleeves["crypto"])
+    payments_label = sleeve_member_text(policy.sleeves["payments"])
+    index_label = sleeve_member_text(policy.sleeves["broad_index"])
+    cluster_mv, cluster_w, _ = sleeve_stats(holdings, policy.sleeves["direct_ai_semi"], grand_total)
+    broad_mv, broad_w, _ = sleeve_stats(holdings, policy.sleeves["broad_ai_cycle"], grand_total)
+    crypto_mv, crypto_w, _ = sleeve_stats(holdings, policy.sleeves["crypto"], grand_total)
+    pay_mv, pay_w, _ = sleeve_stats(holdings, policy.sleeves["payments"], grand_total)
+    voo_mv, voo_w, _ = sleeve_stats(holdings, policy.sleeves["broad_index"], grand_total)
 
     cash_mv = sum(h["market_value"] for h in holdings if is_cash_symbol(h["symbol"]))
     cash_w = (cash_mv / grand_total * 100) if grand_total else 0.0
@@ -1178,7 +693,9 @@ def build_briefing(
     top5_w = sum(h["weight"] for h in top5)
 
     breaches = [
-        h for h in holdings if h["weight"] > SINGLE_NAME_CAP and not is_cash_symbol(h["symbol"])
+        h
+        for h in holdings
+        if h["weight"] > policy.single_name_cap_pct and not is_cash_symbol(h["symbol"])
     ]
 
     cash_by_account = {}
@@ -1222,13 +739,13 @@ def build_briefing(
     must_analyze_block = format_must_analyze(analyze_rows)
     observable_review_block = format_observable_reviews(harvest_reviews, breaches)
 
-    if cluster_w >= CLUSTER_SOFT_CAP:
+    if cluster_w >= policy.cluster_soft_cap_pct:
         cluster_status = (
-            f"ABOVE {CLUSTER_SOFT_CAP:g}% ceiling — do not add; hold-above only "
+            f"ABOVE {policy.cluster_soft_cap_pct:g}% ceiling — do not add; hold-above only "
             "if cutting is punitive ST or no superior immediate deployment exists"
         )
-    elif cluster_w >= CLUSTER_NO_ADD:
-        cluster_status = f"at {CLUSTER_NO_ADD:g}% do-not-increase — do not add"
+    elif cluster_w >= policy.cluster_do_not_increase_pct:
+        cluster_status = f"at {policy.cluster_do_not_increase_pct:g}% do-not-increase — do not add"
     else:
         cluster_status = "within ceiling"
 
@@ -1253,10 +770,10 @@ def build_briefing(
         },
         as_of,
     )
-    prior_snap, prior_label = load_prior_snapshot(as_of)
+    prior_snap, prior_label = load_prior_snapshot(as_of, BRIEFINGS_DIR, OUT_DIR)
     daily_delta = format_daily_delta(today_snap, prior_snap, prior_label)
     today_observation = observation_snapshot_dict(results, harvest_reviews, breaches, as_of)
-    prior_observation, prior_observation_label = load_prior_observation(as_of)
+    prior_observation, prior_observation_label = load_prior_observation(as_of, BRIEFINGS_DIR)
     observed_delta = format_observed_delta(
         today_observation, prior_observation, prior_observation_label
     )
@@ -1308,142 +825,57 @@ def build_briefing(
             "Write 'No candidate change' otherwise."
         )
 
-    prompt = f"""You are a portfolio decision-support analyst. Analyze the whole portfolio.
-
-This is an analytical proposal for human review. It is not an approval, order, execution record, or instruction to trade. Use only supplied values and dated sources. Never invent a price, lot, tax result, approval state, or execution. If a material fact is missing, use **NO ACTION / NEEDS REVIEW**.
-
-Allowed Portfolio Action values are **KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION**. A proposed sale must name the ticker, account, lot, quantity, dollars, proceeds destination, and decision trigger.
-
-**Output mode:** {output_policy.mode}. **Decision focus:** {focus_symbols}. **Candidate refresh:** {"yes" if output_policy.refresh_candidates else "no"}.
-
-Title: **Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
-
----
-
-# 1. Live book
-
-**As of:** {as_of_str} {as_of.tzname() or "ET"}
-**Snapshot coverage:** {snapshot_coverage}
-**E*TRADE total ≈ {fmt_money(grand_total)}**
-**Top-5 (E*TRADE):** {fmt_weight(top5_w)} · **Cash + cash equivalents:** {fmt_money(cash_mv)} ({fmt_weight(cash_w)})
-**Cash composition:** {cash_components}
-
-**Daily delta:**
-{daily_delta}
-
-**Observed account delta** (E*TRADE position evidence only):
-{observed_delta}
-
-**Observable review state** (generated from E*TRADE; evidence, not orders):
-{observable_review_block}
-
-Review flags and position changes do not establish intent, approval, rejection, or execution.
-
-**Factor sleeves (do not invent %):**
-- Direct AI/semi ({direct_members}): **{fmt_weight(cluster_w)}** / {fmt_money(cluster_mv)} — {cluster_status}
-- Broad AI-cycle liquid ({broad_sleeve_label}): **{fmt_weight(broad_w)}** / {fmt_money(broad_mv)} (direct is a lower bound on cycle risk)
-- Crypto ({crypto_label}): {fmt_weight(crypto_w)} / {fmt_money(crypto_mv)}
-- Payments ({payments_label}): {fmt_weight(pay_w)} / {fmt_money(pay_mv)}
-- Broad index ({index_label}): {fmt_weight(voo_w)} / {fmt_money(voo_mv)}
-
-**Constraint math (use these dollars):**
-{constraint_math}
-
-**Marginal $10k from SGOV:**
-{marginal_detail}
-
-**Accounts:**
-{account_lines}
-
-**Funding boundary.** Account totals are not buying power. Every DEPLOY or REPLACE must name the funding account, settled source cash or security, amount, and purchasing account. Never combine cash across accounts.
-
-**Owner profile** (user-maintained; never infer blanks):
-{owner_profile}
-
-**Research continuity** (user-maintained; use its sources and dates, then refresh only what may be stale):
-{context_status}
-{research_records}
-
-**Decision history** (analytical proposals, not trade authority):
-{decision_history}
-
-**Portfolio holdings.** Use this source table for weights and calculations. Do not repeat the full table in the answer.
-
-{holdings_lines}
-
-**Decision focus.** Start with these names. Include another name only when new evidence or an account change makes it material.
-{must_analyze_block}
-
-**Lots** (source of truth). Avg = cost/share. Cost = dollars in. P/L = unrealized. Taxable ST = held ≤ 1 year; LT = held > 1 year. IRA/Roth = economic P/L only — not a CG event. Same ticker in two accounts = two decision buckets.
-
-{tax_table}
-{tax_flag_block}
----
-
-# 2. Rules
-
-**Limits.** Single-name soft max is **{SINGLE_NAME_CAP:g}%**. Direct AI/semi is no-add at **{CLUSTER_NO_ADD:g}%** and has a soft ceiling of **{CLUSTER_SOFT_CAP:g}%**. A soft breach creates review and no-add, not an automatic sale. Use the pre-computed minimum cut. Risk-Off means work toward {RISK_OFF_GLIDE:g}% with tax-aware lots.
-
-**Authority.** E*TRADE data establishes observed positions and observable changes. It does not establish intent or approval. A prior model proposal is historical context. **NO EXECUTION DETECTED** is not approval, rejection, or deferral.
-
-**Decision continuity.** This is a continuing portfolio review, not a fresh stock screen. Use the supplied Decision history table as the only durable proposal record. For every prior model proposal there, classify today's proposal as **UNCHANGED / MODIFIED / REVERSED / RESOLVED**. Otherwise say **NOT CAPTURED**; do not reconstruct it from position data, account changes, or snapshots.
-
-A MODIFIED or REVERSED proposal requires at least one qualifying delta: material company-specific evidence; earnings/guidance/regulatory/competitive change; price or valuation movement material to the original thesis; portfolio-weight/factor/liquidity/tax change; observed execution; or a specific error in the prior analysis. State the prior proposal, new proposal, dated new fact, invalidated assumption, and why the change is sufficient. “Reassessment,” “updated outlook,” “fresh analysis,” and “greater upside” are not sufficient.
-
-**View versus action.** Report Fundamental View as **ATTRACTIVE / NEUTRAL / UNATTRACTIVE / INSUFFICIENT EVIDENCE**. Report Portfolio Action separately. **KEEP** requires dated evidence that the thesis is supported. Missing or stale research means **NO ACTION / RESEARCH INCOMPLETE**.
-
-**Owner profile and hard limits.** Use only supplied profile fields. Treat omitted fields as **UNKNOWN**. Do not infer a risk budget from the current holdings; when a missing item could change an action, use **NO ACTION / NEEDS REVIEW** and identify it.
-
-**Tax.** IRA and Roth gains are economic P/L, not capital gains. A taxable loss is a review, not a sale. Wash-sale status is **CLEAR / POSSIBLE / UNKNOWN** and must name the scope checked. Missing spouse, automatic-purchase, options, open-order, or 61-day data means **NEEDS TAX REVIEW**. Before a taxable-loss sale, state the next 30-day restriction. A backward-looking CLEAR status does not authorize a sale or replacement.
-
-**Hierarchy.** (1) hard concentration / drawdown that makes de-risking valuable even in cash (2) do not tidy a working thesis for a soft breach without a superior deployment (3) risk-adjusted return after the destination is included (4) tax/friction (5) deploy cash only if return beats liquidity. A hard #1 can require REDUCE to cash; a soft threshold alone cannot. #4 beats incremental #3.
-
-**Trade bar.** Prefer **NO ACTION** when evidence, valuation, tax, or implementation is incomplete. **DEPLOY** requires account-specific funding, supported valuation, portfolio fit, and a better use than holding SGOV. **REPLACE** requires a named sale and superior named purchase. **REDUCE** requires hard risk, a broken thesis, unacceptable downside, or valuation that no longer pays for risk and tax. A soft concentration breach alone is not enough.
-
-**Deployment preference.** Do not REDUCE an intact holding merely to create idle cash. Name the immediate destination or state the hard-risk reason cash is better. Use **KEEP** when the thesis is supported and no better deployment exists. Use **NO ACTION** when evidence or implementation is incomplete.
-
-Evaluate the risk of continuing to hold as explicitly as the risk of trading. Owner preferences constrain recommendations; they are not evidence that a holding is attractive. If a preference limits risk reduction, explain the consequence.
-
-**Sizing.** Size only after REDUCE or REPLACE clears the trade bar. Use the pre-computed minimum that fixes the stated problem. A breach or profit alone does not justify a sale.
-
-**Factor.** Ticker diversity is not factor diversity. Broad members ({broad_members}) share the AI-capex cycle. Sleeve labels are lower bounds and omit look-through. Explain why a candidate improves the portfolio and compare it with the best relevant holding.
-
-**REPLACE** names the sale and buy. Moving to cash is REDUCE; investing later is DEPLOY. State risk removed, risk added, tax status, and why the change beats holding.
-
-**Thesis vs price.** Score thesis · valuation · trend · catalyst separately. Price is a trigger, not a thesis — classify moves as market / factor / company / execution / noise. Use a decision trigger, not a vague standalone “hold 6–12 months” horizon.
-
-**Decision quality.** For an actionable proposal, show dated evidence, the changed risk or expectation, valuation, advantage over holding, best alternative, account-specific implementation, strongest counterargument, and invalidation trigger. Keep reporting period, publication date, quote time, and snapshot time separate. Label fragile conclusions. Do not invent precision.
-
-**Tax-loss proposals.** A REDUCE or REPLACE proposal for tax loss must name the taxable account, lot, quantity, expected loss, wash-sale scope, replacement or cash destination, and why the after-tax benefit beats friction and opportunity cost. A usable loss alone does not clear the trade bar.
-
-**Evidence.** Any company-specific fact that initiates, modifies, or reverses an action needs a source and event/publication date. Prefer filings, earnings releases, transcripts, and regulator/company sources. Label unsourced claims and forecasts as assumptions. If current evidence cannot be verified, use INSUFFICIENT EVIDENCE and do not reverse a prior proposal on that basis.
-
-Keep the portfolio snapshot time, quote/session time, financial reporting period, and news publication/event date distinct. Label stale, mixed-session, or unreconciled inputs. A daily headline is not material unless it changes valuation, thesis, risk budget, deployability, or a decision trigger.
-
-**Candidates.** {candidate_instruction} Research conviction is separate from conviction to deploy. Do not invent live prices or valuation facts.
-
-# 3. Tax detail
-
-{tax_detail}
-
-# 4. Output, in this order
-
-**Daily Portfolio Action Briefing – [Today’s Date] – Live E*TRADE Book**
-
-**0. Decision card.** State the overall action, what changed, the largest unresolved risk, the best opportunity if any, and the blocker preventing action. Use no more than five sentences. Include **Analytical proposal — not an approved or submitted trade.**
-
-**1. Material changes.** Report at most three changes from the prior snapshot or observation. Include weight, quantity, account, lot, sleeve, cash, or review changes only when material. Say **No material change** when none exists. Never infer a trade or intent from a position change alone.
-
-**2. Risk and action table.** Cover only the Decision focus names. Use columns **Ticker, Fundamental View, Portfolio Action, Reason, Evidence, Missing fact, Trigger**. Add exact lot and account details only for REDUCE or REPLACE.
-
-**3. Candidate review.** {candidate_output}
-
-**4. Implementation.** Include funding account, settled source, purchasing account, exact lots, quantity, tax, wash-sale scope, proceeds destination, and post-trade weights only when proposing REDUCE, REPLACE, or DEPLOY. Otherwise write **No implementation proposed**.
-
-**5. Decision triggers.** List only triggers for the Decision focus names or candidate names. Use one line per trigger.
-
-Do not repeat the full holdings table, unchanged names, or the safety rules. Keep a routine-day answer under 1,000 words. Expand only when an action, tax review, account change, or material new evidence requires it.
-"""
+    prompt = render_prompt_template(
+        output_mode=output_policy.mode,
+        focus_symbols=focus_symbols,
+        candidate_refresh="yes" if output_policy.refresh_candidates else "no",
+        as_of_str=as_of_str,
+        as_of_tz=as_of.tzname() or "ET",
+        snapshot_coverage=snapshot_coverage,
+        grand_total=fmt_money(grand_total),
+        top5_weight=fmt_weight(top5_w),
+        cash_value=fmt_money(cash_mv),
+        cash_weight=fmt_weight(cash_w),
+        cash_components=cash_components,
+        daily_delta=daily_delta,
+        observed_delta=observed_delta,
+        observable_review_block=observable_review_block,
+        direct_members=direct_members,
+        direct_weight=fmt_weight(cluster_w),
+        direct_value=fmt_money(cluster_mv),
+        cluster_status=cluster_status,
+        broad_sleeve_label=broad_sleeve_label,
+        broad_weight=fmt_weight(broad_w),
+        broad_value=fmt_money(broad_mv),
+        crypto_label=crypto_label,
+        crypto_weight=fmt_weight(crypto_w),
+        crypto_value=fmt_money(crypto_mv),
+        payments_label=payments_label,
+        payments_weight=fmt_weight(pay_w),
+        payments_value=fmt_money(pay_mv),
+        index_label=index_label,
+        index_weight=fmt_weight(voo_w),
+        index_value=fmt_money(voo_mv),
+        constraint_math=constraint_math,
+        marginal_detail=marginal_detail,
+        account_lines=account_lines,
+        owner_profile=owner_profile,
+        context_status=context_status,
+        research_records=research_records,
+        decision_history=decision_history,
+        holdings_lines=holdings_lines,
+        must_analyze_block=must_analyze_block,
+        tax_table=tax_table,
+        tax_flag_block=tax_flag_block,
+        single_name_cap=policy.single_name_cap_pct,
+        cluster_no_add=policy.cluster_do_not_increase_pct,
+        cluster_soft_cap=policy.cluster_soft_cap_pct,
+        risk_off_glide=policy.risk_off_glide_pct,
+        broad_members=broad_members,
+        candidate_instruction=candidate_instruction,
+        tax_detail=tax_detail,
+        candidate_output=candidate_output,
+    )
     return BriefingBuildResult(
         prompt=prompt.strip() + "\n",
         weights_snapshot=today_snap,
@@ -1476,8 +908,8 @@ def save_briefing_result(
     latest = OUT_DIR / "daily_briefing_prompt_latest.md"
     atomic_write_text(dated, result.prompt)
     atomic_write_text(latest, result.prompt)
-    save_weights_snapshot(result.weights_snapshot, as_of)
-    save_observation_snapshot(result.observation_snapshot, as_of)
+    save_weights_snapshot(result.weights_snapshot, as_of, BRIEFINGS_DIR)
+    save_observation_snapshot(result.observation_snapshot, as_of, BRIEFINGS_DIR)
     return dated, latest
 
 
@@ -1498,7 +930,22 @@ def main(argv=None) -> int:
         "--input-file",
         help="Build offline from a portable payload file, or '-' for stdin.",
     )
+    parser.add_argument(
+        "--policy",
+        type=Path,
+        help="Use this decision-policy JSON instead of portfolio_policy.json.",
+    )
     args = parser.parse_args(argv)
+    if args.policy:
+        set_active_policy(load_policy(args.policy))
+    try:
+        return _run(args, parser)
+    except AuthExpiredError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 2
+
+
+def _run(args, parser) -> int:
     if args.from_clipboard or args.input_file:
         if args.allow_partial:
             parser.error("--allow-partial is only available for live fetching")

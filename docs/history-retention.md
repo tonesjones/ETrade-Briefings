@@ -14,7 +14,7 @@ improves decisions. Evaluate this using the durable local records, not tab count
 Candidate policy to validate:
 
 - keep the most recent 20 trading-day tasks active for day-to-day continuity;
-- retain older dated tasks as archived Codex history, searchable if needed;
+- retain older dated tasks as archived history, searchable if needed;
 - keep local snapshots and captured decision records for at least one tax year,
   subject to later review of storage and practical value;
 - preserve any task containing an approved, executed, or materially changed

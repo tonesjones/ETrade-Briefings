@@ -5,27 +5,45 @@ from __future__ import annotations
 
 import argparse
 import os
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pyetrade
 from dotenv import load_dotenv
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_ROOT / ".env"
+AUTH_DATE_KEY = "ETRADE_AUTH_DATE"
+ET = ZoneInfo("America/New_York")
 
 
-def update_env_tokens(path: Path, access_token: str, access_secret: str) -> None:
-    """Atomically update only the two daily access-token entries."""
+def _env_key(line: str) -> str:
+    """Return the variable name on a .env line, tolerating `export` and comments."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return ""
+    key = stripped.split("=", 1)[0].strip()
+    if key.startswith("export "):
+        key = key[len("export "):].strip()
+    return key
+
+
+def update_env_tokens(
+    path: Path, access_token: str, access_secret: str, auth_date: str | None = None
+) -> None:
+    """Atomically update the daily access-token entries (and the auth date)."""
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     replacements = {
         "ETRADE_ACCESS_TOKEN": access_token,
         "ETRADE_ACCESS_TOKEN_SECRET": access_secret,
     }
+    if auth_date:
+        replacements[AUTH_DATE_KEY] = auth_date
     seen = set()
     output = []
     for line in lines:
-        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        key = _env_key(line)
         if key in replacements:
             output.append(f"{key}={replacements[key]}")
             seen.add(key)
@@ -76,7 +94,8 @@ def main(argv=None) -> int:
     access_secret = tokens["oauth_token_secret"]
 
     if not args.no_write_env:
-        update_env_tokens(ENV_PATH, access_token, access_secret)
+        auth_date = datetime.now(ET).strftime("%Y-%m-%d")
+        update_env_tokens(ENV_PATH, access_token, access_secret, auth_date=auth_date)
         print(f"\nAuthorization succeeded; daily tokens were saved to {ENV_PATH.name}.")
     else:
         print("\nAuthorization succeeded; .env was not changed.")

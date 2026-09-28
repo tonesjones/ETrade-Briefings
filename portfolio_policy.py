@@ -6,7 +6,6 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_POLICY_PATH = PROJECT_ROOT / "portfolio_policy.json"
 
@@ -76,4 +75,28 @@ def load_policy(path: Path = DEFAULT_POLICY_PATH) -> PortfolioPolicy:
     )
 
 
-POLICY = load_policy()
+_active: PortfolioPolicy | None = None
+
+
+def active_policy() -> PortfolioPolicy:
+    """Return the policy in effect, loading portfolio_policy.json on first use."""
+    global _active
+    if _active is None:
+        _active = load_policy()
+    return _active
+
+
+def set_active_policy(policy: PortfolioPolicy) -> PortfolioPolicy:
+    """Replace the policy in effect (CLI --policy, tests). Returns the previous one."""
+    global _active
+    previous = active_policy()
+    _active = policy
+    return previous
+
+
+def __getattr__(name: str):
+    # Backwards-compatible `from portfolio_policy import POLICY`, resolved lazily
+    # so importing this module never reads the JSON file by itself.
+    if name == "POLICY":
+        return active_policy()
+    raise AttributeError(name)

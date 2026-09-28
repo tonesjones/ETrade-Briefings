@@ -15,13 +15,13 @@ E\*TRADE access tokens **expire every day at midnight US Eastern**. You must re-
 ### 1. Re-auth (required after midnight ET, or if API rejects tokens)
 
 ```powershell
-cd C:\TestCode\Etrade-Grok
+cd path\to\etrade-briefings
 python etrade_auth.py
 ```
 
 1. Open the printed URL in your browser, log in, and authorize the app
 2. Paste the verification code into the terminal
-3. The script atomically updates the two daily token entries in .env (token secrets are not printed by default)
+3. The script atomically updates the two daily token entries and `ETRADE_AUTH_DATE` in .env (token secrets are not printed by default)
 
 ### 2. Build the briefing prompt
 
@@ -60,13 +60,13 @@ Then:
 2. **Ctrl+V** — the full prompt is already on the clipboard
 3. Send
 
-**Portfolio dump only** (local diagnostic, or if you keep a fixed system prompt on grok.com):
+**Portfolio dump only** (local diagnostic, or if you keep a fixed system prompt in your model):
 
 ```powershell
 python get_portfolio.py
 ```
 
-The daily Grok prompt does **not** reprint that dump. Lots appear once, in a single taxable + IRA + Roth table.
+The daily briefing prompt does **not** reprint that dump. Lots appear once, in a single taxable + IRA + Roth table.
 
 ### Outputs each run
 
@@ -74,7 +74,7 @@ The daily Grok prompt does **not** reprint that dump. Lots appear once, in a sin
 |---------|--------|
 | `build_briefing_prompt.py` | Compact decision-support prompt → clipboard + dated prompt + `weights_*.json` portfolio deltas + `observations_*.json` account/quantity/lot reconciliation |
 | `briefing.cmd` | Offline compact decision-support prompt from the structured clipboard payload → clipboard + dated prompt + snapshots |
-| `get_portfolio.py` | Full per-account dump (cost / P/L / ST-LT) → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` — local diagnostic, not pasted into Grok |
+| `get_portfolio.py` | Full per-account dump (cost / P/L / ST-LT) → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` — local diagnostic, not pasted into the model |
 
 ### What the briefing asks the model to analyze
 
@@ -108,7 +108,7 @@ Observed E*TRADE changes establish that account values changed, but without tran
 |-----------|-------------|
 | **First use, or any time after midnight US Eastern** | Run python etrade_auth.py, authorize, and paste the code; tokens are saved automatically |
 | **Same day, tokens still working** | Just run `build_briefing_prompt.py` / `get_portfolio.py` — no browser |
-| **API rejects tokens** (expired or invalid) | Run python etrade_auth.py again |
+| **API rejects tokens** (expired or invalid) | The scripts stop with a "run etrade_auth.py" message — run it again |
 
 This is an E\*TRADE platform rule, not something this repo can skip. Consumer key/secret stay in `.env` permanently; only the **access** token pair must be refreshed after daily expiry.
 
@@ -119,7 +119,7 @@ This is an E\*TRADE platform rule, not something this repo can skip. Consumer ke
 ### 1. Install
 
 ```powershell
-cd C:\TestCode\Etrade-Grok
+cd path\to\etrade-briefings
 pip install -r requirements.txt
 ```
 
@@ -161,8 +161,12 @@ Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
 | `briefing.cmd` | One-command offline briefing shortcut using the structured clipboard payload |
 | `get_portfolio.py` | Portfolio block only, including cost / P/L / ST-LT |
 | etrade_auth.py | OAuth plus atomic .env token update — once per day after midnight ET |
+| `templates/briefing_prompt.md` | Wording of the briefing prompt (`{placeholders}` are filled by `build_briefing_prompt.py`) |
+| `briefing_snapshots.py` | Daily weight / observation snapshots and the two deltas |
+| `briefing_formatting.py` | Shared money / weight formatting |
 | `portfolio_policy.json` | Decision limits, sleeves, harvest floors, $10k examples |
-| `portfolio_policy.py` | Loads and validates that JSON |
+| `portfolio_policy.py` | Loads and validates that JSON (`--policy path.json` on either script uses another file) |
+| `docs/history-retention.md` | Notes on how much briefing history to keep |
 | `portfolio_context.example.json` | Template for local owner constraints, dated research, and prior analytical proposals |
 | `.env` | Secrets (gitignored) |
 | `.env.example` | Template for secrets |
@@ -176,6 +180,8 @@ Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
 All briefing math and most instruction text read `portfolio_policy.json`. Edit that file — not the Python — when a cap, sleeve, or analysis floor changes. Then run:
 
     python -m unittest discover -s tests -v
+
+To change the wording of the prompt itself, edit `templates/briefing_prompt.md`; placeholders in `{braces}` are filled with computed values.
 
 | Key | What it does |
 |-----|----------------|
@@ -217,7 +223,7 @@ This project is intentionally **read-only** against E\*TRADE:
 | `list_accounts` | Market order helpers used to trade |
 | `get_account_portfolio` (including cost basis / lots) | Any auto-submit of buys/sells |
 
-- Grok recommendations in the briefing prompt are **text only**. Nothing in this repo sends those actions to E\*TRADE.
+- Model recommendations from the briefing prompt are **text only**. Nothing in this repo sends those actions to E\*TRADE.
 - You would have to place trades yourself in the E\*TRADE UI (or deliberately add order code later).
 - OAuth tokens can technically authorize trading APIs if misused, but **this codebase never calls order endpoints**.
 
@@ -225,7 +231,7 @@ This project is intentionally **read-only** against E\*TRADE:
 
 ## Tips
 
-- **Daily live habit:** after midnight ET, run `etrade_auth.py`, run `build_briefing_prompt.py`, open grok.com, and press Ctrl+V.
+- **Daily live habit:** after midnight ET, run `etrade_auth.py`, run `build_briefing_prompt.py`, open your preferred model, and press Ctrl+V.
 - **Daily offline habit:** run `get_portfolio.py`, run `briefing.cmd`, open your preferred model, and press Ctrl+V.
 - Cost basis: both scripts pull E\*TRADE average cost, total cost, unrealized P/L, and **tax lots** (so mixed ST/LT names are split correctly). That adds a few extra read-only lot calls and a few seconds.
 - Daily delta needs yesterday’s `briefings/weights_*.json` (or a prior dated prompt). Same-day re-runs compare to the last *previous calendar day*, not the earlier run today.
@@ -236,7 +242,9 @@ This project is intentionally **read-only** against E\*TRADE:
 
 ## Data completeness and safety
 
-The scripts fetch both portfolio positions and the read-only E*TRADE account balance. The account value—including residual cash—is the weight denominator. Response-shape errors, missing required tax lots, or a failed selected account stop prompt generation rather than silently shrinking the portfolio.
+The scripts fetch every page of portfolio positions and the read-only E*TRADE account balance. The account value—including residual cash—is the weight denominator. Each account must reconcile: positions plus cash must match the reported account value (within five basis points for mark timing), and each holding's tax lots must add up to its share quantity. Response-shape errors, missing or mismatched tax lots, an unreconciled account, or a failed selected account stop prompt generation rather than silently shrinking the portfolio.
+
+Only network errors, throttling (429), and server errors (5xx) are retried. An expired token (401), or an `ETRADE_AUTH_DATE` from an earlier Eastern day, stops immediately with a re-authorize message.
 
 For diagnostics only, use the --allow-partial option with either portfolio command to produce a prominently marked incomplete result. Do not use partial output for trade sizing.
 
@@ -257,5 +265,5 @@ OAuth tokens are saved automatically. Use --no-write-env together with --print-t
 - Commit `.env.example` only (placeholders), not real values
 - Keep the GitHub remote **private**. Never `git add -f` `.env`, `briefings/`, or `prompts/`
 - Local artifacts are the real book: dollars, cost, lots, and account last-4s. Do not zip `briefings/` or `prompts/` into email, a public gist, or a cloud chat
-- Grok sees the full prompt when you paste it — that is the workflow, not a leak in this repo
-- Optional lint: `pip install ruff` then `ruff check .`
+- The model you paste into sees the full prompt — that is the workflow, not a leak in this repo
+- Lint: `pip install ruff` then `ruff check .` (CI runs lint and tests on every push)

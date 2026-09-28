@@ -17,7 +17,10 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
+# Long lines here are prompt prose; the bulk of the wording lives in templates/.
 "build_briefing_prompt.py" = ["E501"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
+
+# Tests use the standard library runner:  python -m unittest discover -s tests -v
