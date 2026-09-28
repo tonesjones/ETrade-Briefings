@@ -486,7 +486,7 @@ def format_daily_delta(today_snap: dict, prior: dict | None, prior_label: str) -
     if today_br and today_br == prior_br:
         lines.append(f"- {cap:g}% breach **unchanged:** " + ", ".join(sorted(today_br)))
     lines.append(
-        "Treat these as market-move vs thesis-move in Daily Delta. "
+        "Classify these moves as market, sector, or company-specific. "
         "Do not repeat unchanged analysis."
     )
     return "\n".join(lines)

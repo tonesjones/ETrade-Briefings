@@ -10,6 +10,7 @@ budget → thesis/valuation → tax/lot → opportunity cost), not a stock check
 from __future__ import annotations
 
 import json
+import re
 import sys
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -36,14 +37,16 @@ from get_portfolio import (
     AuthExpiredError,
     account_tail,
     atomic_write_text,
-    collect_tax_flags,
     copy_to_clipboard,
     fetch_portfolio_block,
-    format_lot_table,
+    fmt_signed_money,
+    fmt_signed_pct,
     is_cash_symbol,
+    lot_term_split,
     parse_portable_portfolio_text,
     read_clipboard_text,
     save_portfolio_block,
+    term_from_lot,
 )
 from portfolio_policy import active_policy, load_policy, set_active_policy
 
@@ -65,7 +68,9 @@ class BriefingOutputPolicy:
     mode: str
     material_symbols: tuple[str, ...]
     refresh_candidates: bool
-    include_tax_detail: bool
+    # Why each material symbol is in focus, and the sized names that are only monitored.
+    focus_reasons: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    monitor_symbols: tuple[str, ...] = ()
 
 # User-editable decision policy (portfolio_policy.json).
 
@@ -156,6 +161,38 @@ def format_decision_history(context: dict) -> str:
         "|---|---|---|---|---|---|---|\n"
         + "\n".join(rows)
     )
+
+
+def format_context_block(context: dict) -> str:
+    """Owner profile always; research notes and decision history only when supplied."""
+    profile = context.get("owner_profile")
+    filled = isinstance(profile, dict) and any(
+        str(value).strip().upper() not in ("", "UNKNOWN") for value in profile.values()
+    )
+    if filled:
+        parts = ["**Owner profile** (user-maintained; treat blanks as UNKNOWN):\n" + format_owner_profile(context)]
+    else:
+        parts = [
+            "**Owner profile:** not supplied. Treat horizon, tax rate, liquidity needs, and hard "
+            "limits as UNKNOWN; flag one only where it would change a REDUCE, REPLACE, or DEPLOY."
+        ]
+    if isinstance(context.get("research"), dict) and context["research"]:
+        parts.append(
+            f"**Your research notes** (updated {context.get('updated_at', 'date not recorded')}; "
+            "start from these and refresh anything dated before the last snapshot):\n"
+            + format_research_records(context)
+        )
+    if has_decision_history(context):
+        parts.append(
+            "**Decision history** (earlier analytical proposals, not trade authority):\n"
+            + format_decision_history(context)
+        )
+    return "\n\n".join(parts)
+
+
+def has_decision_history(context: dict) -> bool:
+    history = context.get("decision_history")
+    return isinstance(history, list) and any(isinstance(item, dict) for item in history)
 
 
 def sleeve_member_text(symbols: tuple[str, ...]) -> str:
@@ -280,32 +317,117 @@ def consolidate(results, grand_total: float):
     return holdings, accounts
 
 
-def holding_line(h: dict, as_of) -> str:
-    alias = f" ({h['alias']})" if h.get("alias") else ""
-    sym = h["symbol"]
-    if is_cash_symbol(sym):
-        return f"- Cash ({sym}) ≈ {fmt_money(h['market_value'])} (~{fmt_weight(h['weight'])})"
-    bits = []
-    tgp = h.get("total_gain_pct")
-    if tgp is not None:
-        bits.append(f"{tgp:+.0f}%")
-    loc = []
-    if h.get("taxable_mv"):
-        loc.append(f"taxable {fmt_money(h['taxable_mv'])}")
-    if h.get("ira_mv"):
-        loc.append(f"IRA {fmt_money(h['ira_mv'])}")
-    if h.get("roth_mv"):
-        loc.append(f"Roth {fmt_money(h['roth_mv'])}")
-    if len(loc) > 1:
-        bits.append(" + ".join(loc))
-    elif h.get("ira_mv") and not h.get("taxable_mv") and not h.get("roth_mv"):
-        bits.append("IRA")
-    elif h.get("roth_mv") and not h.get("taxable_mv") and not h.get("ira_mv"):
-        bits.append("Roth")
-    glance = f"  {'  '.join(bits)}" if bits else ""
+def taxable_gain_by_term(results, as_of: datetime) -> dict[str, dict[str, float]]:
+    """Unrealized taxable lot gain per symbol by term, plus value whose term is unknown.
+
+    Lot gains are marked separately from the position, so LT + ST can differ slightly
+    from the position P/L; that timing gap is not reported as an unknown term.
+    """
+    out: dict[str, dict[str, float]] = defaultdict(lambda: {"LT": 0.0, "ST": 0.0, "unk_mv": 0.0})
+    for result in results or []:
+        if result.get("error") or (result.get("tax_bucket") or "taxable") != "taxable":
+            continue
+        for h in result.get("holdings") or []:
+            symbol = h.get("symbol") or ""
+            if not symbol or is_cash_symbol(symbol):
+                continue
+            split = lot_term_split(h, as_of)
+            row = out[symbol]
+            row["LT"] += split["lt_gain"]
+            row["ST"] += split["st_gain"]
+            row["unk_mv"] += split["unk_mv"]
+    return out
+
+
+def _held_in(h: dict) -> str:
+    parts = [
+        (name, h.get(key) or 0.0)
+        for name, key in (("taxable", "taxable_mv"), ("IRA", "ira_mv"), ("Roth", "roth_mv"))
+        if h.get(key)
+    ]
+    if len(parts) == 1:
+        return parts[0][0]
+    return " · ".join(f"{name} {fmt_money(mv)}" for name, mv in parts)
+
+
+def format_holdings_table(holdings: list[dict], results, as_of: datetime) -> str:
+    """One row per ticker: weight, value, P/L, account split, and taxable gain by term."""
+    gains = taxable_gain_by_term(results, as_of)
+    rows = []
+    for h in holdings:
+        symbol = h["symbol"]
+        if is_cash_symbol(symbol) or h["market_value"] < 50:
+            continue
+        alias = f" ({h['alias']})" if h.get("alias") else ""
+        tg, tgp = h.get("total_gain"), h.get("total_gain_pct")
+        pl = "—"
+        if tg is not None:
+            pl = fmt_signed_money(tg) + (f" ({fmt_signed_pct(tgp)})" if tgp is not None else "")
+        term = gains.get(symbol)
+        taxable = "—"
+        if term:
+            parts = [
+                f"{key} {fmt_signed_money(term[key])}" for key in ("LT", "ST") if abs(term[key]) >= 1
+            ]
+            if term["unk_mv"] >= 1:
+                parts.append(f"term unknown on {fmt_money(term['unk_mv'])} of value")
+            taxable = " · ".join(parts) or "≈ $0"
+        rows.append(
+            f"| {symbol}{alias} | {fmt_weight(h['weight'])} | {fmt_money(h['market_value'])} | "
+            f"${h['price']:,.2f} | {pl} | {_held_in(h)} | {taxable} |"
+        )
+    if not rows:
+        return "_No non-cash holdings._"
     return (
-        f"- {sym}{alias} {fmt_weight(h['weight'])}  "
-        f"({fmt_money(h['market_value'])} @ ${h['price']:.2f}){glance}"
+        "| Ticker | Weight | Value | Price | Unrealized P/L | Held in | Taxable gain by term |\n"
+        "|---|---:|---:|---:|---:|---|---|\n" + "\n".join(rows)
+    )
+
+
+def format_focus_lots(results, symbols, as_of: datetime) -> str:
+    """Taxable lots for focus names, so a proposed sale can name the exact lot."""
+    wanted = set(symbols)
+    rows = []
+    for result in results or []:
+        if result.get("error") or (result.get("tax_bucket") or "taxable") != "taxable":
+            continue
+        acct = account_tail(result.get("label") or "")
+        for h in result.get("holdings") or []:
+            if h.get("symbol") not in wanted:
+                continue
+            lots = h.get("lots") or []
+            if not lots and h.get("date_acquired"):
+                lots = [
+                    {
+                        "qty": h.get("quantity") or 0.0,
+                        "total_cost": h.get("total_cost") or 0.0,
+                        "total_gain": h.get("total_gain") or 0.0,
+                        "acquired": h["date_acquired"],
+                    }
+                ]
+            for lot in lots:
+                qty = lot.get("qty") or 0.0
+                cost = lot.get("total_cost") or 0.0
+                per_share = lot.get("price") or (cost / qty if qty else None)
+                acquired = lot.get("acquired")
+                rows.append(
+                    (
+                        h["symbol"],
+                        acquired.date().isoformat() if acquired else "",
+                        f"| {h['symbol']} | {acct} | "
+                        f"{acquired.strftime('%Y-%m-%d') if acquired else '—'} | {qty:,.4g} | "
+                        f"{f'${per_share:,.2f}' if per_share else '—'} | "
+                        f"{fmt_signed_money(lot.get('total_gain') or 0.0)} | "
+                        f"{term_from_lot(lot, as_of)} |",
+                    )
+                )
+    if not rows:
+        return ""
+    rows.sort(key=lambda row: (row[0], row[1]))
+    return (
+        "**Taxable lots for focus names** (identify a lot by account and acquired date):\n\n"
+        "| Ticker | Acct | Acquired | Qty | Cost/share | Unrealized | Term |\n"
+        "|---|---|---|---:|---:|---:|---|\n" + "\n".join(row[2] for row in rows) + "\n"
     )
 
 
@@ -356,15 +478,15 @@ def format_observable_reviews(harvest_reviews: list[dict], breaches: list[dict])
     for row in harvest_reviews:
         loss = fmt_money(abs(row["total_gain"]))
         lines.append(
-            f"- **{row['symbol']} / {row['account']} — OPEN_TLH_REVIEW:** "
-            f"qty {row['quantity']:,.4g}; MV {fmt_money(row['market_value'])}; "
-            f"unrealized loss -{loss}. Review only — not an approved sale or order."
+            f"- **{row['symbol']} / {row['account']} — taxable loss review:** "
+            f"qty {row['quantity']:,.4g}; value {fmt_money(row['market_value'])}; "
+            f"unrealized loss -{loss}."
         )
     for holding in breaches:
         lines.append(
-            f"- **{holding['symbol']} — CONCENTRATION_REVIEW:** "
+            f"- **{holding['symbol']} — concentration review:** "
             f"{fmt_weight(holding['weight'])} exceeds the "
-            f"{active_policy().single_name_cap_pct:g}% soft maximum. Review only — not an approved sale."
+            f"{active_policy().single_name_cap_pct:g}% soft maximum."
         )
     if not lines:
         return "- No automated TLH or single-name concentration review flags."
@@ -412,25 +534,29 @@ def must_analyze_holdings(
     return out
 
 
-def format_must_analyze(rows: list[dict]) -> str:
-    weight = [r["symbol"] for r in rows if "weight" in r["analyze_reasons"]]
-    extra = [r for r in rows if "weight" not in r["analyze_reasons"]]
-    lines = []
-    if weight:
-        lines.append(f"- Weight ≥ {active_policy().analyze_weight_floor_pct:g}%: " + ", ".join(weight))
-    if extra:
-        bits = []
-        for row in extra:
-            tags = []
-            if "harvest" in row["analyze_reasons"]:
-                tags.append("taxable harvest")
-            tgp, tg = row.get("total_gain_pct"), row.get("total_gain")
-            if "loss" in row["analyze_reasons"]:
-                tags.append(f"{tgp:+.0f}%" if tgp is not None else fmt_money(tg))
-            bits.append(row["symbol"] + (f" ({', '.join(tags)})" if tags else ""))
-        lines.append("- Additional required analysis: " + ", ".join(bits))
-    if not lines:
-        return "- None"
+def _analyze_reason_text(row: dict) -> list[str]:
+    reasons = []
+    if "weight" in row["analyze_reasons"]:
+        reasons.append(f"weight ≥ {active_policy().analyze_weight_floor_pct:g}%")
+    if "loss" in row["analyze_reasons"]:
+        tgp, tg = row.get("total_gain_pct"), row.get("total_gain")
+        reasons.append(
+            f"material loss ({tgp:+.0f}%)" if tgp is not None else f"material loss ({fmt_money(tg)})"
+        )
+    return reasons
+
+
+def format_focus_block(output_policy: BriefingOutputPolicy) -> str:
+    """One focus list with the reason each name is in it, plus monitor-only names."""
+    lines = [
+        f"- **{symbol}** — {'; '.join(reasons)}"
+        for symbol, reasons in output_policy.focus_reasons
+    ] or ["- None today. Scan the monitor names only."]
+    if output_policy.monitor_symbols:
+        lines.append(
+            "\n**Monitor only** (no write-up unless research finds a material, "
+            "company-specific event): " + ", ".join(output_policy.monitor_symbols)
+        )
     return "\n".join(lines)
 
 
@@ -465,22 +591,33 @@ def briefing_output_policy(
                 previous_date = None
     gap = (as_of.date() - previous_date).days if previous_date else None
     refresh_candidates = first_run or (gap is not None and gap >= 7) or decision_day
-    include_tax_detail = bool(harvest_reviews) and decision_day
     required = must_analyze_holdings(
         holdings, {row["symbol"] for row in harvest_reviews}
     )
-    material = (
-        {row["symbol"] for row in required}
-        if decision_day
-        else {row["symbol"] for row in harvest_reviews}
-    )
-    material.update(weight_changes | observation_changes)
-    material.update(row["symbol"] for row in breaches)
+    reasons: dict[str, list[str]] = defaultdict(list)
+    cap = active_policy().single_name_cap_pct
+    for row in breaches:
+        reasons[row["symbol"]].append(f"above {cap:g}% single-name limit")
+    for row in harvest_reviews:
+        if "taxable loss review" not in reasons[row["symbol"]]:
+            reasons[row["symbol"]].append("taxable loss review")
+    for symbol in sorted(weight_changes):
+        reasons[symbol].append("weight moved ≥ 0.5 pp since last snapshot")
+    for symbol in sorted(observation_changes):
+        reasons[symbol].append("quantity or lot change since last snapshot")
+    if decision_day:
+        for row in required:
+            reasons[row["symbol"]].extend(_analyze_reason_text(row))
+    # Focus follows portfolio weight so the largest positions lead.
+    order = {h["symbol"]: -(h.get("market_value") or 0.0) for h in holdings}
+    focus = sorted(reasons, key=lambda s: (order.get(s, 0.0), s))
+    monitor = [row["symbol"] for row in required if row["symbol"] not in reasons]
     return BriefingOutputPolicy(
         mode="DECISION DAY" if decision_day else "ROUTINE DAY",
-        material_symbols=tuple(sorted(material)),
+        material_symbols=tuple(sorted(reasons)),
         refresh_candidates=refresh_candidates,
-        include_tax_detail=include_tax_detail,
+        focus_reasons=tuple((s, tuple(reasons[s])) for s in focus),
+        monitor_symbols=tuple(monitor),
     )
 
 
@@ -655,7 +792,8 @@ def render_prompt_template(**fields) -> str:
     new computed value is needed. Placeholders use str.format syntax.
     """
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    return template.format(**fields)
+    # Optional blocks render empty; collapse the blank lines they leave behind.
+    return re.sub(r"\n{3,}", "\n\n", template.format(**fields))
 
 
 def build_briefing(
@@ -730,13 +868,8 @@ def build_briefing(
         account_bits.append(f"  - {shown}{loc_note}: ≈ {fmt_money(a['total'])}{cash_note}")
     account_lines = "\n".join(account_bits) if account_bits else "  - _No funded accounts._"
 
-    holdings_lines = "\n".join(
-        holding_line(h, as_of) for h in holdings if h["market_value"] >= 50
-    )
+    holdings_table = format_holdings_table(holdings, results, as_of)
     harvest_reviews = taxable_harvest_reviews(results)
-    harvest_symbols = {row["symbol"] for row in harvest_reviews}
-    analyze_rows = must_analyze_holdings(holdings, harvest_symbols)
-    must_analyze_block = format_must_analyze(analyze_rows)
     observable_review_block = format_observable_reviews(harvest_reviews, breaches)
 
     if cluster_w >= policy.cluster_soft_cap_pct:
@@ -748,15 +881,6 @@ def build_briefing(
         cluster_status = f"at {policy.cluster_do_not_increase_pct:g}% do-not-increase — do not add"
     else:
         cluster_status = "within ceiling"
-
-    tax_table = (
-        format_lot_table(results, as_of)
-        if results is not None
-        else "_Lot table unavailable this run._"
-    )
-    tax_flag_lines = collect_tax_flags(results, as_of) if results is not None else []
-    tax_flags = "\n".join(tax_flag_lines)
-    tax_flag_block = f"\n**Tax flags:**\n{tax_flags}\n" if tax_flags else ""
 
     today_snap = snapshot_dict(
         holdings,
@@ -792,43 +916,51 @@ def build_briefing(
     marginal_10k = format_marginal_10k(
         holdings, grand_total, cluster_mv, broad_mv, cash_mv, results=results
     )
-    owner_profile = format_owner_profile(context)
-    research_records = format_research_records(context)
-    decision_history = format_decision_history(context)
-    focus_symbols = ", ".join(output_policy.material_symbols) or "none"
-    tax_detail = (
-        f"{tax_table}{tax_flag_block}"
-        if output_policy.include_tax_detail
-        else "_Exact lots remain in the source data. Do not propose a tax-sensitive action without naming the account and lot._"
+    context_block = format_context_block(context)
+    if not context and CONTEXT_PATH.exists():
+        # The file exists but could not be used; say so rather than silently ignoring it.
+        context_block = f"{context_status}\n\n{context_block}"
+    focus_block = format_focus_block(output_policy)
+    focus_lots_block = format_focus_lots(results, output_policy.material_symbols, as_of)
+    prior_date = str((prior_snap or {}).get("date") or (prior_snap or {}).get("as_of") or "")[:10]
+    research_window = (
+        f"since the last snapshot ({prior_date})" if prior_date else "from the last 30 days"
     )
-    marginal_detail = (
-        marginal_10k
+    marginal_block = (
+        f"\n**Marginal $10k from SGOV:**\n{marginal_10k}\n"
         if output_policy.refresh_candidates
-        else "_Recalculate the $10k example only if proposing DEPLOY or REPLACE._"
+        else ""
+    )
+    continuity_rule = (
+        "**Prior proposals.** For each proposal in the decision history, mark today's as "
+        "UNCHANGED / MODIFIED / REVERSED / RESOLVED. MODIFIED or REVERSED needs a dated new fact "
+        "that invalidates an earlier assumption; a fresh look or a vaguely better outlook is not enough.\n\n"
+        if has_decision_history(context)
+        else ""
     )
     if output_policy.refresh_candidates:
         candidate_instruction = (
-            "Refresh the candidate list. Include at most two non-held candidates. "
-            "Use NO ACTION / WATCH unless the trade bar is met."
+            "Suggest at most two non-held ideas that would improve the portfolio. Don't add "
+            "AI-cycle exposure while the direct AI/semi sleeve is at or above its no-add level. "
+            "An idea can be worth watching without meeting the bar to buy today."
         )
         candidate_output = (
-            "Include at most two non-held candidates. For each, give role, dated evidence, "
-            "entry condition, principal risk, and why it improves the portfolio."
+            "At most two non-held ideas. For each: role in the portfolio, dated evidence, entry "
+            "condition, main risk, and the holding or cash it would be funded from."
         )
     else:
-        candidate_instruction = (
-            "Do not generate new tickers today. Recheck the existing candidates in the "
-            "supplied research context and report only a changed trigger or thesis."
-        )
-        candidate_output = (
-            "Report existing candidates only when their trigger or thesis changed. "
-            "Write 'No candidate change' otherwise."
-        )
+        candidate_instruction = "No new ideas today; the focus names come first."
+        candidate_output = "Write **No candidate review today**."
 
     prompt = render_prompt_template(
         output_mode=output_policy.mode,
-        focus_symbols=focus_symbols,
         candidate_refresh="yes" if output_policy.refresh_candidates else "no",
+        research_window=research_window,
+        focus_block=focus_block,
+        focus_lots_block=focus_lots_block,
+        context_block=context_block,
+        continuity_rule=continuity_rule,
+        marginal_block=marginal_block,
         as_of_str=as_of_str,
         as_of_tz=as_of.tzname() or "ET",
         snapshot_coverage=snapshot_coverage,
@@ -857,23 +989,14 @@ def build_briefing(
         index_weight=fmt_weight(voo_w),
         index_value=fmt_money(voo_mv),
         constraint_math=constraint_math,
-        marginal_detail=marginal_detail,
         account_lines=account_lines,
-        owner_profile=owner_profile,
-        context_status=context_status,
-        research_records=research_records,
-        decision_history=decision_history,
-        holdings_lines=holdings_lines,
-        must_analyze_block=must_analyze_block,
-        tax_table=tax_table,
-        tax_flag_block=tax_flag_block,
+        holdings_table=holdings_table,
         single_name_cap=policy.single_name_cap_pct,
         cluster_no_add=policy.cluster_do_not_increase_pct,
         cluster_soft_cap=policy.cluster_soft_cap_pct,
         risk_off_glide=policy.risk_off_glide_pct,
         broad_members=broad_members,
         candidate_instruction=candidate_instruction,
-        tax_detail=tax_detail,
         candidate_output=candidate_output,
     )
     return BriefingBuildResult(

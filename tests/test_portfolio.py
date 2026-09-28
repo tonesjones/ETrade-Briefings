@@ -595,7 +595,7 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertIn("Broad index (" + " ".join(POLICY.sleeves["broad_index"]) + ")", prompt)
         self.assertIn(f"work toward {POLICY.risk_off_glide_pct:g}%", prompt)
         self.assertIn(
-            f"Weight ≥ {POLICY.analyze_weight_floor_pct:g}%",
+            f"weight ≥ {POLICY.analyze_weight_floor_pct:g}%",
             prompt,
         )
         self.assertIn("$10k purchase examples are unavailable", prompt)
@@ -805,25 +805,89 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertNotIn(secret_key, json.dumps(snapshot))
         self.assertEqual(snapshot["positions"][0]["account"], "…7810")
 
-    def test_holding_line_still_parses_for_daily_delta(self):
-        line = briefing.holding_line(
+    def _amd_two_lot_results(self):
+        lot = dict(price=50.0, total_cost=5_000.0, market_value=10_000.0)
+        return [
             {
-                "symbol": "AMD",
-                "alias": None,
-                "weight": 15.2,
-                "market_value": 180_133,
-                "price": 482.93,
-                "total_gain_pct": 165.0,
-                "taxable_mv": 132_806,
-                "ira_mv": 47_327,
-                "roth_mv": 0.0,
+                "label": "Brokerage (…7810)",
+                "tax_bucket": "taxable",
+                "total_value": 20_000.0,
+                "holdings": [
+                    {
+                        "symbol": "AMD", "quantity": 200.0, "market_value": 20_000.0,
+                        "price": 100.0, "total_cost": 10_000.0, "total_gain": 10_000.0,
+                        "lots": [
+                            {**lot, "qty": 100.0, "total_gain": 5_000.0, "term_code": 1,
+                             "acquired": datetime(2023, 1, 5, tzinfo=ET)},
+                            {**lot, "qty": 100.0, "total_gain": 5_000.0, "term_code": 2,
+                             "acquired": datetime(2026, 3, 2, tzinfo=ET)},
+                        ],
+                    }
+                ],
             },
-            datetime(2026, 8, 12, tzinfo=ET),
+            {
+                "label": "Traditional IRA (…6183)",
+                "tax_bucket": "traditional",
+                "total_value": 5_000.0,
+                "holdings": [
+                    {"symbol": "AMD", "quantity": 50.0, "market_value": 5_000.0, "price": 100.0,
+                     "total_cost": 4_000.0, "total_gain": 1_000.0,
+                     "lots": [{**lot, "qty": 50.0, "total_gain": 1_000.0,
+                               "acquired": datetime(2025, 1, 5, tzinfo=ET)}]},
+                ],
+            },
+        ]
+
+    def test_holdings_table_splits_taxable_gain_by_term_and_ignores_ira(self):
+        as_of = datetime(2026, 9, 18, tzinfo=ET)
+        results = self._amd_two_lot_results()
+        holdings, _ = briefing.consolidate(results, 25_000.0)
+        table = briefing.format_holdings_table(holdings, results, as_of)
+        row = next(line for line in table.splitlines() if line.startswith("| AMD"))
+        self.assertIn("taxable $20,000 · IRA $5,000", row)
+        # The IRA gain has no tax effect, so only the two taxable lots appear by term.
+        self.assertIn("LT +$5,000 · ST +$5,000", row)
+
+    def test_focus_lots_name_each_taxable_lot_and_skip_ira(self):
+        as_of = datetime(2026, 9, 18, tzinfo=ET)
+        block = briefing.format_focus_lots(self._amd_two_lot_results(), ("AMD",), as_of)
+        lot_rows = [line for line in block.splitlines() if line.startswith("| AMD")]
+        self.assertEqual(len(lot_rows), 2)
+        self.assertIn("2023-01-05", lot_rows[0])
+        self.assertIn("| LT |", lot_rows[0])
+        self.assertIn("| ST |", lot_rows[1])
+        self.assertNotIn("…6183", block)
+        self.assertEqual(briefing.format_focus_lots(self._amd_two_lot_results(), (), as_of), "")
+
+    def test_blank_owner_profile_counts_as_not_supplied(self):
+        blank = {"owner_profile": {"horizon": "", "marginal_tax_rate": "UNKNOWN"}}
+        self.assertIn("**Owner profile:** not supplied", briefing.format_context_block(blank))
+        filled = {"owner_profile": {"horizon": "15+ years"}}
+        block = briefing.format_context_block(filled)
+        self.assertIn("15+ years", block)
+        self.assertNotIn("Decision history", block)
+
+    def test_routine_day_has_one_focus_list_with_reasons(self):
+        as_of = datetime(2026, 9, 18, 16, 0, tzinfo=ET)
+        amd = consolidated("AMD", 20_000.0, 20.0, **AMD_ONLY)
+        voo = consolidated("VOO", 10_000.0, 10.0)
+        snap = briefing.snapshot_dict(
+            [amd, voo],
+            {"grand_total": 100_000.0, "cluster_w": 20.0, "broad_w": 20.0,
+             "cash_w": 0.0, "top5_w": 30.0, "breaches": ["AMD"]},
+            as_of,
         )
-        snap = briefing.parse_snapshot_from_prompt("**Consolidated holdings**\n" + line + "\n")
-        self.assertEqual(snap["holdings"][0]["symbol"], "AMD")
-        self.assertAlmostEqual(snap["holdings"][0]["weight"], 15.2)
-        self.assertAlmostEqual(snap["holdings"][0]["market_value"], 180_133)
+        observation = {"positions": [], "reviews": []}
+        policy = briefing.briefing_output_policy(
+            [amd, voo], [], [amd], snap, snap, observation, observation, as_of
+        )
+        self.assertEqual(policy.mode, "ROUTINE DAY")
+        self.assertEqual(policy.material_symbols, ("AMD",))
+        self.assertEqual(policy.monitor_symbols, ("VOO",))
+        block = briefing.format_focus_block(policy)
+        self.assertIn("**AMD** — above", block)
+        self.assertIn("**Monitor only**", block)
+        self.assertIn("VOO", block.split("**Monitor only**")[1])
 
     def test_lot_table_covers_ira_and_skips_cash(self):
         as_of = datetime(2026, 8, 12, tzinfo=ET)

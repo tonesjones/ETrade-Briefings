@@ -78,20 +78,17 @@ The daily briefing prompt does **not** reprint that dump. Lots appear once, in a
 
 ### What the briefing asks the model to analyze
 
-The prompt is a **decision-support engine**, not a holdings dump. The model has no trading authority and its output is an analytical proposal, not an approved or submitted trade. It is required to:
+The prompt is a **decision-support engine**, not a holdings dump. It is written for a model with web search (for example Codex). The model has no trading authority and its output is an analytical proposal, not an approved or submitted trade. It is asked to:
 
-- Lead with **Trade / No trade** and a **confidence** (no-trade can be high conviction)
-- Prefer the **smallest dollar cut** that actually fixes a limit (e.g. restore 15%, not “sell 15% of the name”)
-- Show the **$10k marginal** effect of any buy on direct AI/semi, broad AI-cycle, cash, and top-5
-- On Trim/Sell, **compare at least two account/lot choices** — no fixed IRA-first or taxable-first waterfall
-- Treat **Replace** as sell + a named replacement (cash is Reduce / Deploy, not Replace)
-- Treat a soft concentration breach as **review + no-add**, not an automatic sale: do not reduce an intact holding into idle cash unless de-risking itself clears a hard-risk bar; otherwise require an immediately attractive named deployment or use KEEP / NO ACTION
-- Give every new research idea an explicit **High / Medium / Low conviction**, separate from conviction to deploy at today's valuation
-- Respect **wash-sale** on taxable losses
-- Include a **horizon** on every action and a directional **stress** (Nasdaq −10%, semi −15%, etc.) — no fake VaR
-- Separate **Fundamental View** from **Portfolio Action**
-- Reconcile prior proposals when they are available and justify every reversal with dated evidence
-- Treat observable TLH and concentration flags as reviews, not orders
+- **Research first**: search for dated news on each focus name since the last snapshot, check the market backdrop, and scan the monitor-only names for material events. "No material news" counts as evidence.
+- Work from **one focus list**: each name carries its reason (limit breach, taxable loss review, weight or position change, or size and loss on a decision day). Other sized holdings are monitor-only.
+- Give each focus name a **Fundamental View** and, separately, one **Portfolio Action** (KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION). NO ACTION is reserved for a named missing fact that would change the decision.
+- Treat a soft concentration breach as **review + no-add**, not an automatic sale, and start any limit-driven cut from the pre-computed **smallest dollar cut**
+- Name the account and **exact taxable lot** for any sale (lots for focus names are included) and respect **wash-sale** rules on taxable losses
+- Cite every company-specific fact with its **source and date**, and replace vague horizons with observable triggers
+- Reconcile prior proposals when a decision history is supplied
+
+Blocks with nothing to say (no research notes, no decision history, the $10k example on routine days) are left out of the prompt.
 
 It injects two independent deltas:
 
@@ -209,7 +206,7 @@ Copy `portfolio_context.example.json` to `portfolio_context.json` and fill it in
 - `research`: one dated record per held name or recurring candidate, including the valuation or entry condition, decision trigger, metrics, and primary sources.
 - `decision_history`: prior analytical proposals and their conditions. Record approval or confirmed execution only when you have that evidence; a model recommendation itself is not approval.
 
-The prompt requires a dated `THESIS SUPPORTED` record for `KEEP`. When no current research record exists, it directs the analyst to use `NO ACTION / RESEARCH INCOMPLETE` and name the missing fact. Keep completed research concise and update it after earnings or a material event; daily runs should only refresh facts that may have changed.
+All three sections are optional. A blank owner profile is reported as "not supplied", and the model flags a missing field only where it would change a trade. Research notes give the model a starting point; without them it researches each focus name itself. Keep notes concise and update them after earnings or a material event.
 
 ---
 
