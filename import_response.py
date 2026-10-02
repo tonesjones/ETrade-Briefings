@@ -122,6 +122,26 @@ def find_account(results: list[dict], raw_account) -> tuple[dict | None, str | N
     return matches[0], None
 
 
+def unit_value(holding: dict) -> float:
+    """Dollar value of one unit as held: market value / quantity.
+
+    For an option this includes the contract multiplier (quote price x 100),
+    which a bare quote price would miss; for a stock it equals the price.
+    """
+    qty = holding.get("quantity") or 0.0
+    if qty and holding.get("market_value") is not None:
+        return holding["market_value"] / qty
+    return holding.get("price") or 0.0
+
+
+def underlying_of(symbol: str, holdings_by_symbol: dict | None = None) -> str:
+    """Underlying ticker: the holding's own field, else the first word of an option symbol."""
+    held = (holdings_by_symbol or {}).get(symbol)
+    if held and held.get("underlying"):
+        return str(held["underlying"]).upper()
+    return str(symbol or "").split(" ")[0].upper()
+
+
 def _find_holding(account: dict, ticker: str) -> dict | None:
     for holding in account["holdings"]:
         if holding["symbol"] == ticker:
@@ -191,7 +211,7 @@ def _check_sell(checks, trade, account, holding, as_of, sells_by_holding, lot_us
         )
         return
     sells_by_holding[key] = sold_so_far
-    price = holding["price"]
+    price = unit_value(holding)
     rec["price"] = price
     rec["amount"] = qty * price
     rec["valid"] = True
@@ -241,6 +261,15 @@ def _check_sell(checks, trade, account, holding, as_of, sells_by_holding, lot_us
         return
     i, lot, used = chosen
     lot_used[(account["label"], ticker, i)] = used + qty
+    if not lot.get("total_cost") or lot["total_cost"] <= 0:
+        rec.update({"lot_acquired": wanted.isoformat(), "tax_note": "cost basis unknown",
+                    "lot_index": i})
+        checks.warn(
+            "basis_unknown",
+            f"{tid}: {ticker} lot {wanted.isoformat()} has no cost basis in the data; "
+            "realized gain not computed. Check the basis in E*TRADE before selling.",
+        )
+        return
     basis_per_share = lot["total_cost"] / lot["qty"]
     gain = qty * (price - basis_per_share)
     term = term_from_lot(lot, as_of)
@@ -268,7 +297,7 @@ def _check_buy(checks, trade, holdings_by_symbol):
     tid, ticker, qty = trade["id"], trade["ticker"], trade["quantity"]
     rec = trade["record"]
     held = holdings_by_symbol.get(ticker)
-    price = held["price"] if held else None
+    price = unit_value(held) if held else None
     if price is None and _is_number(trade.get("est_price")) and trade["est_price"] > 0:
         price = float(trade["est_price"])
     rec["valid"] = True
@@ -395,14 +424,18 @@ def _check_trades(checks, parsed, results, as_of, holdings_by_symbol):
 
 def _check_wash_sales(checks, sells, buys, results, as_of) -> None:
     as_of_date = to_et(as_of).date()
+    by_symbol = {
+        h["symbol"]: h for account in results for h in account["holdings"]
+    }
     for sell in sells:
         rec = sell["record"]
         gain = rec.get("realized_gain")
         if gain is None or gain >= 0 or sell["_account"].get("tax_bucket") != "taxable":
             continue
         tid, ticker = sell["id"], sell["ticker"]
+        underlying = underlying_of(ticker, by_symbol)
         for buy in buys:
-            if buy["ticker"] == ticker:
+            if underlying_of(buy["ticker"], by_symbol) == underlying:
                 checks.error(
                     "wash_sale_buy_in_proposal",
                     f"{tid}: sells {ticker} at a loss of {_money(gain)} while {buy['id']} buys "
@@ -410,17 +443,23 @@ def _check_wash_sales(checks, sells, buys, results, as_of) -> None:
                 )
         recent = []
         for account in results:
-            holding = _find_holding(account, ticker)
-            if holding is None:
-                continue
-            for i, lot in enumerate(_lots_of(holding)):
-                if lot.get("acquired") is None:
+            for holding in account["holdings"]:
+                if underlying_of(holding["symbol"], by_symbol) != underlying:
                     continue
-                if account["label"] == sell["account_label"] and i == rec.get("lot_index"):
-                    continue  # the lot being sold is not its own replacement
-                age = (as_of_date - to_et(lot["acquired"]).date()).days
-                if 0 <= age <= WASH_WINDOW_DAYS:
-                    recent.append(f"{account['label']} lot {_lot_label(lot)}")
+                for i, lot in enumerate(_lots_of(holding)):
+                    if lot.get("acquired") is None:
+                        continue
+                    if (
+                        account["label"] == sell["account_label"]
+                        and holding["symbol"] == ticker
+                        and i == rec.get("lot_index")
+                    ):
+                        continue  # the lot being sold is not its own replacement
+                    age = (as_of_date - to_et(lot["acquired"]).date()).days
+                    if 0 <= age <= WASH_WINDOW_DAYS:
+                        recent.append(
+                            f"{account['label']} {holding['symbol']} lot {_lot_label(lot)}"
+                        )
         if recent:
             checks.warn(
                 "wash_sale_possible",
@@ -569,6 +608,19 @@ def validate_reply(
             checks.error(
                 "web_research_required_for_trades",
                 "trades were proposed without web_research: true",
+            )
+        names = parsed.get("names") if isinstance(parsed.get("names"), list) else []
+        unsupported = sorted(
+            str(n.get("ticker"))
+            for n in names
+            if isinstance(n, dict)
+            and (n.get("view") != "INSUFFICIENT_EVIDENCE" or n.get("action") != "NO_ACTION")
+        )
+        if unsupported:
+            checks.error(
+                "views_without_research",
+                "without web research every name must be INSUFFICIENT_EVIDENCE / NO_ACTION; "
+                f"got other views or actions for {', '.join(unsupported)}",
             )
 
     _check_names(checks, parsed, meta, as_of_date)

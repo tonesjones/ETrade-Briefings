@@ -473,8 +473,16 @@ _TAXABLE_ACCOUNT_TYPES = frozenset({
 # Whole-word markers only: substring matching classified e.g. "Sept Savings"
 # as an IRA. Misreading a taxable account as tax-exempt is the dangerous error,
 # so anything not clearly retirement stays taxable.
-_ROTH_NAME_RE = re.compile(r"\bROTH\b")
-_RETIREMENT_NAME_RE = re.compile(r"\b(?:IRA|401\(?K\)?|403\(?B\)?)\b")
+_RETIREMENT_NAME_WORDS = frozenset({
+    "IRA", "401K", "403B", "SEP", "SIMPLE", "PENSION", "COVERDELL",
+    "ROLLOVER", "CONTRIBUTORY", "TRADITIONAL",
+})
+
+
+def _name_words(text: str) -> set[str]:
+    """Upper-case words split on anything non-alphanumeric ("ROTH_IRA" -> ROTH, IRA)."""
+    text = text.upper().replace("(K)", "K").replace("(B)", "B")
+    return set(re.sub(r"[^A-Z0-9]+", " ", text).split())
 
 
 def _normalize_account_type(raw) -> str:
@@ -498,9 +506,10 @@ def tax_bucket_from_account(acct: dict) -> str:
         str(acct.get(k) or "")
         for k in ("accountDesc", "accountName", "accountMode")
     ).upper()
-    if _ROTH_NAME_RE.search(blob):
+    words = _name_words(blob)
+    if "ROTH" in words:
         bucket = "roth"
-    elif _RETIREMENT_NAME_RE.search(blob):
+    elif words & _RETIREMENT_NAME_WORDS:
         bucket = "traditional"
     else:
         bucket = "taxable"

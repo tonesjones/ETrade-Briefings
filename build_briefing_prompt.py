@@ -19,7 +19,7 @@ from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 
-from briefing_formatting import fmt_money, fmt_weight
+from briefing_formatting import fmt_money, fmt_qty, fmt_weight
 from briefing_snapshots import (  # noqa: F401 - re-exported for callers and tests
     _changed_observation_symbols,
     _changed_weight_symbols,
@@ -35,6 +35,7 @@ from briefing_snapshots import (  # noqa: F401 - re-exported for callers and tes
     snapshot_dict,
 )
 from get_portfolio import (
+    PORTABLE_BEGIN,
     AuthExpiredError,
     account_tail,
     atomic_write_text,
@@ -442,7 +443,7 @@ def format_focus_lots(results, symbols, as_of: datetime) -> str:
                         h["symbol"],
                         acquired.date().isoformat() if acquired else "",
                         f"| {h['symbol']} | {acct} | "
-                        f"{acquired.strftime('%Y-%m-%d') if acquired else '—'} | {qty:,.4g} | "
+                        f"{acquired.strftime('%Y-%m-%d') if acquired else '—'} | {fmt_qty(qty)} | "
                         f"{f'${per_share:,.2f}' if per_share else '—'} | "
                         f"{fmt_signed_money(lot.get('total_gain') or 0.0)} | "
                         f"{term} | {to_lt} |",
@@ -557,14 +558,14 @@ def format_observable_reviews(harvest_reviews: list[dict], breaches: list[dict])
         lot_text = ""
         if lots:
             parts = [
-                f"{lot['acquired'] or 'date unknown'} qty {lot['qty']:,.4g} "
+                f"{lot['acquired'] or 'date unknown'} qty {fmt_qty(lot['qty'])} "
                 f"{fmt_signed_money(lot['total_gain'])} {lot['term']}"
                 for lot in lots
             ]
             lot_text = "; losing lots: " + "; ".join(parts)
         lines.append(
             f"- **{row['symbol']} / {row['account']} — taxable loss review:** "
-            f"qty {row['quantity']:,.4g}; value {fmt_money(row['market_value'])}; "
+            f"qty {fmt_qty(row['quantity'])}; value {fmt_money(row['market_value'])}; "
             f"{pnl}{lot_text}."
         )
     for holding in breaches:
@@ -1148,7 +1149,7 @@ def save_briefing_result(
     latest = OUT_DIR / "daily_briefing_prompt_latest.md"
     atomic_write_text(dated, result.prompt)
     atomic_write_text(latest, result.prompt)
-    if result.meta:
+    if result.meta and PORTABLE_BEGIN in portfolio_block:
         BRIEFINGS_DIR.mkdir(exist_ok=True)
         atomic_write_text(BRIEFINGS_DIR / result.meta["portfolio_file"], portfolio_block + "\n")
         meta_text = json.dumps(result.meta, indent=2)

@@ -366,8 +366,15 @@ class ImportResponseTests(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_web_research_false_warns_and_rejects_trades(self):
-        checks, _p, _c = self.validate(reply_text(web_research=False))
+        unresearched = [
+            {"ticker": t, "view": "INSUFFICIENT_EVIDENCE", "action": "NO_ACTION", "sources": []}
+            for t in ("AAA", "BBB")
+        ]
+        checks, _p, _c = self.validate(reply_text(web_research=False, names_list=unresearched))
         self.assertEqual(self.codes(checks), ["web_research_not_confirmed"])
+        # Without research, a KEEP / ATTRACTIVE view is remembered opinion, not evidence.
+        checks, _p, _c = self.validate(reply_text(web_research=False))
+        self.assertIn("views_without_research", self.codes(checks))
         code, out = self.run_import(reply_text([sell(quantity=1)], web_research=False))
         self.assertEqual(code, 1)
         self.assertIn("REJECTED", out)

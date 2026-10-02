@@ -9,5 +9,11 @@ def fmt_money(x: float) -> str:
     return f"${x:,.0f}"
 
 
+def fmt_qty(q: float) -> str:
+    """Exact share quantity: no rounding beyond 6 decimals, no scientific notation."""
+    text = f"{q:,.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def fmt_weight(w: float) -> str:
     return f"{w:.1f}%"
