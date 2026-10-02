@@ -227,14 +227,27 @@ def save_observation_snapshot(snap: dict, as_of: datetime, briefings_dir: Path) 
     return dated
 
 
+_FILE_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def _earlier_dated(paths, as_of: datetime) -> list[Path]:
+    """Dated files strictly before as_of's date, newest first.
+
+    A back-dated rebuild must never compare against a newer snapshot.
+    """
+    today = as_of.strftime("%Y-%m-%d")
+    dated = []
+    for path in paths:
+        match = _FILE_DATE_RE.search(path.name)
+        if match and match.group(1) < today:
+            dated.append((match.group(1), path))
+    return [path for _date, path in sorted(dated, reverse=True)]
+
+
 def load_prior_observation(
     as_of: datetime, briefings_dir: Path
 ) -> tuple[dict | None, str]:
-    today = as_of.strftime("%Y-%m-%d")
-    paths = sorted(briefings_dir.glob("observations_20*.json"), reverse=True)
-    for path in paths:
-        if today in path.name:
-            continue
+    for path in _earlier_dated(briefings_dir.glob("observations_20*.json"), as_of):
         try:
             return json.loads(path.read_text(encoding="utf-8")), path.name
         except (OSError, json.JSONDecodeError):
@@ -401,20 +414,13 @@ def parse_snapshot_from_prompt(text: str) -> dict | None:
 def load_prior_snapshot(
     as_of: datetime, briefings_dir: Path, prompts_dir: Path
 ) -> tuple[dict | None, str]:
-    today = as_of.strftime("%Y-%m-%d")
-    json_files = sorted(briefings_dir.glob("weights_20*.json"), reverse=True)
-    for path in json_files:
-        if today in path.name:
-            continue
+    for path in _earlier_dated(briefings_dir.glob("weights_20*.json"), as_of):
         try:
             return json.loads(path.read_text(encoding="utf-8")), path.name
         except (OSError, json.JSONDecodeError):
             continue
 
-    prompt_files = sorted(prompts_dir.glob("daily_briefing_prompt_20*.md"), reverse=True)
-    for path in prompt_files:
-        if today in path.name:
-            continue
+    for path in _earlier_dated(prompts_dir.glob("daily_briefing_prompt_20*.md"), as_of):
         try:
             parsed = parse_snapshot_from_prompt(path.read_text(encoding="utf-8"))
         except OSError:

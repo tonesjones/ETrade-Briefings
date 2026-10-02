@@ -264,17 +264,16 @@ class CashLotTests(unittest.TestCase):
         )
         self.assertEqual(holdings, [])
 
-    def test_positive_residual_synthesized_when_cash_fields_missing(self):
-        holdings = []
-        portfolio.apply_cash_lot(
-            holdings,
-            account_total=1078.0,
-            position_total=1000.0,
-            cash_from_balance=None,
-        )
-        self.assertEqual(len(holdings), 1)
-        self.assertEqual(holdings[0]["symbol"], "CASH")
-        self.assertEqual(holdings[0]["market_value"], 78.0)
+    def test_positive_residual_without_cash_fields_fails_closed(self):
+        # The residual could be a missing position; plugging it as cash would
+        # make reconciliation pass by construction.
+        with self.assertRaises(portfolio.PortfolioDataError):
+            portfolio.apply_cash_lot(
+                [],
+                account_total=1078.0,
+                position_total=1000.0,
+                cash_from_balance=None,
+            )
 
     def test_official_cash_is_used_instead_of_residual(self):
         holdings = []
@@ -315,6 +314,9 @@ class BriefingPolicyTests(unittest.TestCase):
                 ),
                 patch.object(briefing, "copy_to_clipboard", return_value=True),
                 patch.object(portfolio, "PROJECT_ROOT", root),
+                patch.object(
+                    briefing, "now_et", return_value=datetime(2026, 9, 18, 18, 0, tzinfo=ET)
+                ),
                 redirect_stdout(io.StringIO()),
             ):
                 exit_code = briefing.main(["--input-file", str(fixture)])
@@ -641,7 +643,9 @@ class BriefingPolicyTests(unittest.TestCase):
         self.assertIsNone(holdings[0]["total_gain"])
         self.assertIsNone(holdings[0]["total_gain_pct"])
 
-    def test_marginal_10k_reranks_top_five_after_sgov_to_top_five_transfer(self):
+    def test_marginal_10k_top_five_excludes_cash_source(self):
+        # Cash is not concentration: moving $10k of SGOV into VOO (already top-5)
+        # raises non-cash top-5 by the full $10k / $165k.
         holdings = [
             {"symbol": "SGOV", "market_value": 50_000.0},
             {"symbol": "VOO", "market_value": 40_000.0},
@@ -665,7 +669,7 @@ class BriefingPolicyTests(unittest.TestCase):
             ],
         )
         voo_row = next(line for line in table.splitlines() if line.startswith("| VOO |"))
-        self.assertEqual(voo_row.split("|")[5].strip(), "0")
+        self.assertEqual(voo_row.split("|")[5].strip(), "+6.06 pp")
 
     def test_taxable_review_is_not_hidden_by_ira_gain(self):
         results = [
