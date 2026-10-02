@@ -69,7 +69,26 @@ class Checks:
 def extract_json_block(reply: str) -> str | None:
     """Return the body of the LAST fenced json block, or None."""
     blocks = _JSON_FENCE.findall(reply or "")
-    return blocks[-1] if blocks else None
+    if blocks:
+        return blocks[-1]
+    return _find_bare_json_object(reply or "")
+
+
+def _find_bare_json_object(reply: str) -> str | None:
+    """Fallback for copies that dropped the fences: the LAST JSON object with a briefing_id."""
+    decoder = json.JSONDecoder()
+    found = None
+    pos = reply.find("{")
+    while pos != -1:
+        try:
+            obj, end = decoder.raw_decode(reply, pos)
+        except json.JSONDecodeError:
+            pos = reply.find("{", pos + 1)
+            continue
+        if isinstance(obj, dict) and "briefing_id" in obj:
+            found = reply[pos:end]
+        pos = reply.find("{", end)
+    return found
 
 
 def _valid_date(value) -> date | None:
@@ -582,7 +601,7 @@ def validate_reply(
     computed: dict = {"trades": [], "weights": None, "tax_summary": None}
     block = extract_json_block(reply)
     if block is None:
-        checks.error("no_json_block", "no fenced ```json block found in the reply")
+        checks.error("no_json_block", "no ```json block (or bare JSON object with a briefing_id) found in the reply")
         return checks, None, computed
     try:
         parsed = json.loads(block)
