@@ -12,6 +12,7 @@ briefings/
 prompts/
 logs/
 portfolio_context.json
+responses/
 
 # Python
 __pycache__/

@@ -96,6 +96,7 @@ def _portable_holding(holding: dict) -> dict:
     keys = (
         "symbol", "quantity", "price", "market_value", "price_paid",
         "cost_per_share", "total_cost", "total_gain", "total_gain_pct",
+        "security_type", "underlying",
     )
     item = {key: holding.get(key) for key in keys}
     item["date_acquired"] = _portable_datetime(holding.get("date_acquired"))
@@ -268,6 +269,8 @@ def parse_portable_portfolio_text(text: str):
                 })
             holdings.append({
                 "symbol": symbol,
+                "security_type": str(raw_holding.get("security_type") or "EQ").upper(),
+                "underlying": str(raw_holding.get("underlying") or symbol).upper().strip(),
                 "quantity": quantity,
                 "price": price,
                 "market_value": market_value,
@@ -1047,6 +1050,8 @@ def parse_account_cash(resp: dict) -> float | None:
 def cash_holding(amount: float) -> dict:
     return {
         "symbol": "CASH",
+        "security_type": "CASH",
+        "underlying": "CASH",
         "quantity": amount,
         "price": 1.0,
         "market_value": amount,
@@ -1189,6 +1194,32 @@ def get_portfolio(account_id_key: str, accounts_api=None, lots_required: bool = 
     return first
 
 
+def _option_display_symbol(underlying, product) -> str:
+    """Distinct display symbol for an option, e.g. "NVDA 2026-12-18 200C".
+
+    Fails closed: any missing or invalid contract field raises rather than guessing.
+    """
+    call_put = str(_first(product, "callPut") or "").strip().upper()
+    strike = _as_float(_first(product, "strikePrice"))
+    parts = []
+    for key in ("expiryYear", "expiryMonth", "expiryDay"):
+        value = _as_float(_first(product, key))
+        parts.append(int(value) if value is not None and value == int(value) else None)
+    year, month, day = parts
+    if call_put not in {"CALL", "PUT"} or strike is None or None in parts:
+        raise PortfolioDataError(
+            f"Option position on {underlying} is missing contract details "
+            "(callPut, strikePrice, expiry)"
+        )
+    try:
+        expiry = datetime(year, month, day).strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise PortfolioDataError(
+            f"Option position on {underlying} has an invalid expiry date"
+        ) from exc
+    return f"{underlying} {expiry} {strike:g}{call_put[0]}"
+
+
 def extract_holdings(portfolio_resp):
     """Parse portfolio response into holdings list and total value."""
     try:
@@ -1213,6 +1244,10 @@ def extract_holdings(portfolio_resp):
             symbol = _first(product, "symbol")
             if not symbol:
                 raise PortfolioDataError("Portfolio position has no symbol")
+            underlying = symbol
+            security_type = str(_first(product, "securityType") or "EQ").strip().upper()
+            if security_type == "OPTN" or _first(product, "callPut") is not None:
+                symbol = _option_display_symbol(underlying, product)
             quantity = _as_float(_first(pos, "quantity"), 0.0) or 0.0
             market_value = _as_float(_first(pos, "marketValue"), 0.0) or 0.0
             quick = _first(pos, "Quick", "quick") or {}
@@ -1235,6 +1270,8 @@ def extract_holdings(portfolio_resp):
 
             holdings.append({
                 "symbol": symbol,
+                "security_type": security_type,
+                "underlying": underlying,
                 "quantity": quantity,
                 "price": price,
                 "market_value": market_value,

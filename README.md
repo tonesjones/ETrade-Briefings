@@ -4,8 +4,6 @@ Pulls live E*TRADE positions (all active accounts), builds a **decision-support*
 
 Each holding includes E\*TRADE **price paid**, **cost per share**, **total cost**, **unrealized P/L**, and **date acquired**. Taxable lots are labeled **ST** (held ≤ 1 year) or **LT** (held > 1 year). IRA/Roth show economic P/L but are **not** treated as capital-gains events. The prompt also pre-computes **direct AI/semi** vs **broad AI-cycle** weights so concentration is not just the six chip tickers.
 
-No xAI API key or API credits required.
-
 ---
 
 ## Daily workflow (recommended)
@@ -60,6 +58,16 @@ Then:
 2. **Ctrl+V** — the full prompt is already on the clipboard
 3. Send
 
+### 3. Import the model's reply (recommended)
+
+The prompt asks the model to end with a fenced `json` block of its actions. Copy the model's whole reply, then run:
+
+```powershell
+python import_response.py --engine codex --from-clipboard
+```
+
+Use `--engine claude`, `chatgpt`, `grok`, or `other` to match the model you used. The script checks the reply against the exact portfolio data the prompt was built from: every focus name answered, tickers and accounts exist, quantities within the lot, cash available in the same account, wash-sale lookback across all accounts, and no adds to the direct AI/semi sleeve at its no-add level. It recomputes proceeds, realized gain per lot (ST/LT and days until long-term), and weights before and after. It prints ACCEPTED or REJECTED and saves the reply and checks under `responses/`. Treat a REJECTED reply's trades as unusable. Use `--input-file reply.md` instead of the clipboard if needed.
+
 **Portfolio dump only** (local diagnostic, or if you keep a fixed system prompt in your model):
 
 ```powershell
@@ -75,6 +83,7 @@ The daily briefing prompt does **not** reprint that dump. Lots appear once, in a
 | `build_briefing_prompt.py` | Compact decision-support prompt → clipboard + dated prompt + `weights_*.json` portfolio deltas + `observations_*.json` account/quantity/lot reconciliation |
 | `briefing.cmd` | Offline compact decision-support prompt from the structured clipboard payload → clipboard + dated prompt + snapshots |
 | `get_portfolio.py` | Full per-account dump (cost / P/L / ST-LT) → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` — local diagnostic, not pasted into the model |
+| `import_response.py` | Validated reply → `responses/YYYY-MM-DD_<engine>.md` + `.json` (checks, computed trades, weights) |
 
 ### What the briefing asks the model to analyze
 
@@ -157,6 +166,7 @@ Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
 | `build_briefing_prompt.py` | **Daily command** — live portfolio + decision-engine prompt → clipboard |
 | `briefing.cmd` | One-command offline briefing shortcut using the structured clipboard payload |
 | `get_portfolio.py` | Portfolio block only, including cost / P/L / ST-LT |
+| `import_response.py` | Validates a model reply against the briefing's portfolio data and saves it |
 | etrade_auth.py | OAuth plus atomic .env token update — once per day after midnight ET |
 | `templates/briefing_prompt.md` | Wording of the briefing prompt (`{placeholders}` are filled by `build_briefing_prompt.py`) |
 | `briefing_snapshots.py` | Daily weight / observation snapshots and the two deltas |
@@ -253,12 +263,14 @@ Run the offline regression suite with:
 
 OAuth tokens are saved automatically. Use --no-write-env together with --print-tokens only when manual token handling is explicitly needed.
 
+Holding periods come from each lot's acquired date. E*TRADE's lot `termCode` is undocumented, so it is used only when the date is missing, and the lot table marks any disagreement for review. Offline input older than 24 hours is refused unless you pass `--allow-stale`. Option positions are kept separate from their underlying stock and shown at market value; their delta exposure is not computed.
+
 ## Security
 
 - **`.env` is gitignored** (and `.env.*` except `.env.example`) — safe to push the repo to GitHub without uploading keys
 - Before first push, confirm: `git check-ignore -v .env` should print a match
 - Never hard-code API keys
-- `briefings/` and `prompts/` are gitignored (position data is sensitive)
+- `briefings/`, `prompts/`, and `responses/` are gitignored (position data is sensitive)
 - Commit `.env.example` only (placeholders), not real values
 - Keep the GitHub remote **private**. Never `git add -f` `.env`, `briefings/`, or `prompts/`
 - Local artifacts are the real book: dollars, cost, lots, and account last-4s. Do not zip `briefings/` or `prompts/` into email, a public gist, or a cloud chat

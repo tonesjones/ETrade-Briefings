@@ -373,7 +373,8 @@ def format_holdings_table(holdings: list[dict], results, as_of: datetime) -> str
     rows = []
     for h in holdings:
         symbol = h["symbol"]
-        if is_cash_symbol(symbol) or h["market_value"] < 50:
+        # abs(): a short option has negative value and must still be shown.
+        if is_cash_symbol(symbol) or abs(h["market_value"]) < 50:
             continue
         alias = f" ({h['alias']})" if h.get("alias") else ""
         tg, tgp = h.get("total_gain"), h.get("total_gain_pct")
@@ -481,37 +482,65 @@ def top5_noncash_weight(values: dict[str, float], total: float) -> float:
     return sum(ranked[:5]) / total * 100
 
 
-def taxable_harvest_reviews(results) -> list[dict]:
+def _loss_lots(holding: dict, as_of: datetime) -> list[dict]:
+    """Lots individually below the harvest threshold, worst first."""
+    threshold = active_policy().harvest_loss_dollars
+    out = []
+    for lot in holding.get("lots") or []:
+        gain = lot.get("total_gain")
+        if gain is None or gain >= threshold:
+            continue
+        acquired = lot.get("acquired")
+        out.append(
+            {
+                "acquired": acquired.strftime("%Y-%m-%d") if acquired else None,
+                "qty": lot.get("qty") or 0.0,
+                "total_gain": gain,
+                "term": term_from_lot(lot, as_of),
+            }
+        )
+    out.sort(key=lambda row: row["total_gain"])
+    return out
+
+
+def taxable_harvest_reviews(results, as_of: datetime | None = None) -> list[dict]:
     """Return account-level taxable-loss reviews from the source positions.
 
     This deliberately avoids consolidated ticker P/L: an IRA gain in the same
-    ticker must not hide a taxable loss that still requires review.
+    ticker must not hide a taxable loss that still requires review. A position
+    is flagged when its net P/L or any single lot is below the harvest threshold,
+    since a net-gain position can still hold a losing lot worth harvesting.
     """
+    as_of = as_of or now_et()
     reviews = []
+    seen: set[tuple[str, str]] = set()
     for result in results or []:
         if result.get("error") or result.get("tax_bucket") != "taxable":
             continue
         label = result.get("label") or "Taxable account"
+        account = account_tail(label) or label
         for holding in result.get("holdings") or []:
             symbol = holding.get("symbol") or ""
             if not symbol or is_cash_symbol(symbol):
                 continue
-            market_value = holding.get("market_value") or 0.0
+            if review_size(holding) < active_policy().analyze_market_value_floor:
+                continue
             total_gain = holding.get("total_gain")
-            if (
-                review_size(holding) >= active_policy().analyze_market_value_floor
-                and total_gain is not None
-                and total_gain < active_policy().harvest_loss_dollars
-            ):
-                reviews.append(
-                    {
-                        "symbol": symbol,
-                        "account": account_tail(label) or label,
-                        "quantity": holding.get("quantity") or 0.0,
-                        "market_value": market_value,
-                        "total_gain": total_gain,
-                    }
-                )
+            loss_lots = _loss_lots(holding, as_of)
+            position_loss = total_gain is not None and total_gain < active_policy().harvest_loss_dollars
+            if not (position_loss or loss_lots) or (account, symbol) in seen:
+                continue
+            seen.add((account, symbol))
+            reviews.append(
+                {
+                    "symbol": symbol,
+                    "account": account,
+                    "quantity": holding.get("quantity") or 0.0,
+                    "market_value": holding.get("market_value") or 0.0,
+                    "total_gain": total_gain,
+                    "loss_lots": loss_lots,
+                }
+            )
     return reviews
 
 
@@ -519,11 +548,24 @@ def format_observable_reviews(harvest_reviews: list[dict], breaches: list[dict])
     """Format deterministic review flags. These are never approvals or orders."""
     lines = []
     for row in harvest_reviews:
-        loss = fmt_money(abs(row["total_gain"]))
+        total_gain = row.get("total_gain")
+        if total_gain is not None and total_gain < active_policy().harvest_loss_dollars:
+            pnl = f"unrealized loss -{fmt_money(abs(total_gain))}"
+        else:
+            pnl = f"position P/L {fmt_signed_money(total_gain or 0.0)}"
+        lots = row.get("loss_lots") or []
+        lot_text = ""
+        if lots:
+            parts = [
+                f"{lot['acquired'] or 'date unknown'} qty {lot['qty']:,.4g} "
+                f"{fmt_signed_money(lot['total_gain'])} {lot['term']}"
+                for lot in lots
+            ]
+            lot_text = "; losing lots: " + "; ".join(parts)
         lines.append(
             f"- **{row['symbol']} / {row['account']} — taxable loss review:** "
             f"qty {row['quantity']:,.4g}; value {fmt_money(row['market_value'])}; "
-            f"unrealized loss -{loss}."
+            f"{pnl}{lot_text}."
         )
     for holding in breaches:
         lines.append(
@@ -912,7 +954,24 @@ def build_briefing(
     account_lines = "\n".join(account_bits) if account_bits else "  - _No funded accounts._"
 
     holdings_table = format_holdings_table(holdings, results, as_of)
-    harvest_reviews = taxable_harvest_reviews(results)
+    option_symbols = sorted(
+        {
+            h["symbol"]
+            for r in results or []
+            if not r.get("error")
+            for h in r.get("holdings") or []
+            if h.get("security_type") == "OPTN"
+        }
+    )
+    options_note = (
+        "- **Options held** ("
+        + ", ".join(option_symbols)
+        + "): shown at market value only. Sleeve weights exclude them and their delta "
+        "exposure to the underlying is not computed; account for it before sizing a trade.\n"
+        if option_symbols
+        else ""
+    )
+    harvest_reviews = taxable_harvest_reviews(results, as_of)
     observable_review_block = format_observable_reviews(harvest_reviews, breaches)
 
     if cluster_w >= policy.cluster_soft_cap_pct:
@@ -1034,6 +1093,7 @@ def build_briefing(
         index_label=index_label,
         index_weight=fmt_weight(voo_w),
         index_value=fmt_money(voo_mv),
+        options_note=options_note,
         constraint_math=constraint_math,
         account_lines=account_lines,
         holdings_table=holdings_table,
@@ -1053,7 +1113,10 @@ def build_briefing(
             "schema_version": 1,
             "briefing_id": briefing_id,
             "as_of": as_of.isoformat(),
-            "portfolio_file": f"portfolio_{as_of:%Y-%m-%d}.txt",
+            # A frozen copy written with this sidecar: get_portfolio.py re-runs
+            # overwrite portfolio_<date>.txt, and a reply must be checked against
+            # the exact data its prompt showed.
+            "portfolio_file": f"briefing_{as_of:%Y-%m-%d}_portfolio.txt",
             "focus_symbols": [symbol for symbol, _reasons in output_policy.focus_reasons],
             "monitor_symbols": list(output_policy.monitor_symbols),
         },
@@ -1086,6 +1149,8 @@ def save_briefing_result(
     atomic_write_text(dated, result.prompt)
     atomic_write_text(latest, result.prompt)
     if result.meta:
+        BRIEFINGS_DIR.mkdir(exist_ok=True)
+        atomic_write_text(BRIEFINGS_DIR / result.meta["portfolio_file"], portfolio_block + "\n")
         meta_text = json.dumps(result.meta, indent=2)
         atomic_write_text(BRIEFINGS_DIR / f"briefing_{date_str}.json", meta_text)
         atomic_write_text(BRIEFINGS_DIR / "briefing_latest.json", meta_text)

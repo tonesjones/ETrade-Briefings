@@ -41,7 +41,7 @@ Cite every fact with its source and publication date, and prefer company release
 - Crypto ({crypto_label}): {crypto_weight} / {crypto_value}
 - Payments ({payments_label}): {payments_weight} / {payments_value}
 - Broad index ({index_label}): {index_weight} / {index_value}
-
+{options_note}
 **Constraint math (use these dollars):**
 {constraint_math}
 {marginal_block}
