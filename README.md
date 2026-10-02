@@ -68,6 +68,31 @@ python import_response.py --engine codex --from-clipboard
 
 Use `--engine claude`, `chatgpt`, `grok`, or `other` to match the model you used. The script checks the reply against the exact portfolio data the prompt was built from: every focus name answered, tickers and accounts exist, quantities within the lot, cash available in the same account, wash-sale lookback across all accounts, and no adds to the direct AI/semi sleeve at its no-add level. It recomputes proceeds, realized gain per lot (ST/LT and days until long-term), and weights before and after. It prints ACCEPTED or REJECTED and saves the reply and checks under `responses/`. Treat a REJECTED reply's trades as unusable. Use `--input-file reply.md` instead of the clipboard if needed.
 
+Notes:
+
+- Copy the **whole** reply (use the message's copy button), not just the json block. If the copy drops the ```` ``` ```` fences, the importer still finds the last JSON object that has a `briefing_id`.
+- `no_json_block` after that means the model did not write the block. Ask it to "end with the fenced json actions block exactly as the prompt specified" and import the new reply.
+- To re-check a reply you already saved, without copying it again: `python import_response.py --engine codex --input-file .\responses\YYYY-MM-DD_codex_N.md`. Each import saves under a new `_N` suffix; nothing is overwritten.
+- ACCEPTED means the trades are consistent with your positions, not that they are good ideas. Read the reasoning and the realized-gain / ST-LT numbers in the saved `.json` before placing anything.
+
+### 4. Optional: compare two models
+
+Paste the same prompt into two models (for example Codex and Claude) in fresh chats, and import each reply with its own `--engine`. Trades both recommend are the stronger signal; where they disagree, compare the reasoning and the tax impact in each `responses/*.json`. Ignore a REJECTED reply's trades.
+
+### Running it from a local Claude Code session
+
+Run `claude` in the project folder (or open it in the Claude desktop app's Code tab). Claude can then run the build and import scripts, read `responses/`, and compare the models' replies for you. You still do the browser login for `etrade_auth.py`, paste the prompt into any outside model, and place trades yourself in E\*TRADE.
+
+### Getting updates
+
+The default branch is `master`:
+
+```powershell
+git pull origin master
+```
+
+After pulling, rebuild the prompt before sending it to a model, so the reply follows the current contract.
+
 **Portfolio dump only** (local diagnostic, or if you keep a fixed system prompt in your model):
 
 ```powershell
