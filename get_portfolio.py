@@ -23,11 +23,12 @@ import json
 import locale
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 from argparse import ArgumentParser
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -466,11 +467,11 @@ _TRADITIONAL_ACCOUNT_TYPES = frozenset({
 _TAXABLE_ACCOUNT_TYPES = frozenset({
     "INDIVIDUAL", "BROKERAGE", "MARGIN", "JOINT", "CUSTODIAL", "TRUST",
 })
-_RETIREMENT_NAME_MARKERS = (
-    "IRA", "CONTRIBUTORY", "TRADITIONAL", "401K", "401(K)", "403B", "403(B)",
-    "SEP", "SIMPLE", "PENSION", "RETIREMENT", "COVERDELL",
-    "MONEY_PURCHASE", "PROFIT_SHARING", "INDIVIDUAL_K",
-)
+# Whole-word markers only: substring matching classified e.g. "Sept Savings"
+# as an IRA. Misreading a taxable account as tax-exempt is the dangerous error,
+# so anything not clearly retirement stays taxable.
+_ROTH_NAME_RE = re.compile(r"\bROTH\b")
+_RETIREMENT_NAME_RE = re.compile(r"\b(?:IRA|401\(?K\)?|403\(?B\)?)\b")
 
 
 def _normalize_account_type(raw) -> str:
@@ -487,15 +488,25 @@ def tax_bucket_from_account(acct: dict) -> str:
     if acct_type in _TAXABLE_ACCOUNT_TYPES:
         return "taxable"
 
+    if acct_type.endswith("IRA") or "401K" in acct_type or "403B" in acct_type:
+        return "traditional"
+
     blob = " ".join(
         str(acct.get(k) or "")
         for k in ("accountDesc", "accountName", "accountMode")
     ).upper()
-    if "ROTH" in blob:
-        return "roth"
-    if any(marker in blob for marker in _RETIREMENT_NAME_MARKERS):
-        return "traditional"
-    return "taxable"
+    if _ROTH_NAME_RE.search(blob):
+        bucket = "roth"
+    elif _RETIREMENT_NAME_RE.search(blob):
+        bucket = "traditional"
+    else:
+        bucket = "taxable"
+    LOGGER.warning(
+        "Unrecognized E*TRADE accountType %r for %s; treated as %s from its name. "
+        "Verify before relying on tax treatment.",
+        acct.get("accountType"), account_label(acct), bucket,
+    )
+    return bucket
 
 
 def tax_bucket_label(bucket: str) -> str:
@@ -530,14 +541,41 @@ def extract_lots(pos: dict) -> list[dict]:
     return lots
 
 
+# E*TRADE documents PositionLot.termCode only as "The term code", so the
+# 1 = LT / 2 = ST reading is an inference. The acquired date decides; the code is
+# used only when the date is missing, and a disagreement is surfaced for review.
+_TERM_CODES = {1: "LT", 2: "ST"}
+
+
 def term_from_lot(lot: dict, as_of: datetime) -> str:
-    """Prefer E*TRADE termCode (1=LT, 2=ST) — that is what a sale will be reported as."""
-    code = lot.get("term_code")
-    if code == 1:
-        return "LT"
-    if code == 2:
-        return "ST"
-    return holding_period(lot.get("acquired"), as_of)
+    """Holding period from the acquired date; termCode only when the date is missing."""
+    if lot.get("acquired") is not None:
+        return holding_period(lot.get("acquired"), as_of)
+    return _TERM_CODES.get(lot.get("term_code"), "unknown")
+
+
+def lot_term_conflict(lot: dict, as_of: datetime) -> bool:
+    """True when E*TRADE's termCode disagrees with the acquired-date holding period."""
+    broker = _TERM_CODES.get(lot.get("term_code"))
+    if broker is None or lot.get("acquired") is None:
+        return False
+    return broker != holding_period(lot.get("acquired"), as_of)
+
+
+def long_term_date(acquired: datetime) -> datetime:
+    """First calendar day (ET) on which a sale of this lot is long-term."""
+    return datetime.combine(
+        anniversary_plus_one_year(to_et(acquired)).date(), datetime.min.time(), tzinfo=ET
+    ) + timedelta(days=1)
+
+
+def days_to_long_term(lot: dict, as_of: datetime) -> int | None:
+    """Calendar days until the lot turns LT; None when already LT or the date is unknown."""
+    acquired = lot.get("acquired")
+    if acquired is None:
+        return None
+    days = (long_term_date(acquired).date() - to_et(as_of).date()).days
+    return days if days > 0 else None
 
 
 def parse_lots_response(raw) -> list[dict]:
@@ -1039,8 +1077,13 @@ def apply_cash_lot(
         return
     residual = account_total - position_total
     if residual >= CASH_RESIDUAL_FLOOR:
-        holdings.append(cash_holding(residual))
-        holdings.sort(key=lambda h: h["market_value"], reverse=True)
+        # Without a reported cash figure, an unexplained residual is
+        # indistinguishable from a missing position; plugging it as cash would
+        # make the reconciliation below pass by construction.
+        raise PortfolioDataError(
+            f"Balance response has no cash fields and positions are ${residual:,.2f} "
+            "short of the account value; cannot tell cash from a missing position"
+        )
 
 
 def parse_account_balance(resp: dict) -> float:

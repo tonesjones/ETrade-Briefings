@@ -107,12 +107,14 @@ class LotTermTests(unittest.TestCase):
         self.assertEqual(lots[0]["qty"], 5.0)
         self.assertEqual(lots[0]["term_code"], 1)
 
-    def test_broker_term_code_beats_date_arithmetic(self):
-        # Acquired 30 days ago, but E*TRADE says LT (e.g. inherited/gifted basis).
+    def test_acquired_date_decides_term_and_broker_code_only_flags_conflict(self):
+        # termCode semantics are undocumented, so the acquired date decides.
         recent = datetime(2026, 8, 19, tzinfo=ET)
         term = portfolio.term_from_lot
-        self.assertEqual(term({"term_code": 1, "acquired": recent}, AS_OF), "LT")
-        self.assertEqual(term({"term_code": None, "acquired": recent}, AS_OF), "ST")
+        self.assertEqual(term({"term_code": 1, "acquired": recent}, AS_OF), "ST")
+        self.assertTrue(portfolio.lot_term_conflict({"term_code": 1, "acquired": recent}, AS_OF))
+        self.assertFalse(portfolio.lot_term_conflict({"term_code": 2, "acquired": recent}, AS_OF))
+        self.assertEqual(term({"term_code": 1, "acquired": None}, AS_OF), "LT")
 
     def test_mixed_lots_split_value_and_gain(self):
         holding = {"market_value": 300.0, "total_gain": 120.0, "lots": [

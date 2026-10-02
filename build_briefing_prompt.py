@@ -16,6 +16,7 @@ from argparse import ArgumentParser
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 
 from briefing_formatting import fmt_money, fmt_weight
@@ -38,11 +39,16 @@ from get_portfolio import (
     account_tail,
     atomic_write_text,
     copy_to_clipboard,
+    days_to_long_term,
     fetch_portfolio_block,
     fmt_signed_money,
     fmt_signed_pct,
+    format_portable_portfolio_text,
     is_cash_symbol,
+    long_term_date,
+    lot_term_conflict,
     lot_term_split,
+    now_et,
     parse_portable_portfolio_text,
     read_clipboard_text,
     save_portfolio_block,
@@ -54,6 +60,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 OUT_DIR = PROJECT_ROOT / "prompts"
 BRIEFINGS_DIR = PROJECT_ROOT / "briefings"
 CONTEXT_PATH = PROJECT_ROOT / "portfolio_context.json"
+# Offline input older than this is refused unless --allow-stale is given.
+MAX_OFFLINE_AGE_HOURS = 24
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,14 @@ class BriefingBuildResult:
     prompt: str
     weights_snapshot: dict
     observation_snapshot: dict
+    # What import_response.py needs to tie a model reply back to this prompt.
+    meta: dict | None = None
+
+
+def make_briefing_id(as_of: datetime, weights_snapshot: dict) -> str:
+    """Date plus a short hash of the data, so a reply can be matched to its prompt."""
+    digest = sha256(json.dumps(weights_snapshot, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"{as_of:%Y-%m-%d}-{digest[:8]}"
 
 
 @dataclass(frozen=True)
@@ -411,6 +427,15 @@ def format_focus_lots(results, symbols, as_of: datetime) -> str:
                 cost = lot.get("total_cost") or 0.0
                 per_share = lot.get("price") or (cost / qty if qty else None)
                 acquired = lot.get("acquired")
+                term = term_from_lot(lot, as_of)
+                if lot_term_conflict(lot, as_of):
+                    term += " ⚠ E*TRADE term code disagrees; verify before selling"
+                days = days_to_long_term(lot, as_of)
+                to_lt = (
+                    f"{days}d ({long_term_date(acquired).date().isoformat()})"
+                    if days is not None
+                    else ("—" if term.startswith("LT") else "unknown")
+                )
                 rows.append(
                     (
                         h["symbol"],
@@ -419,7 +444,7 @@ def format_focus_lots(results, symbols, as_of: datetime) -> str:
                         f"{acquired.strftime('%Y-%m-%d') if acquired else '—'} | {qty:,.4g} | "
                         f"{f'${per_share:,.2f}' if per_share else '—'} | "
                         f"{fmt_signed_money(lot.get('total_gain') or 0.0)} | "
-                        f"{term_from_lot(lot, as_of)} |",
+                        f"{term} | {to_lt} |",
                     )
                 )
     if not rows:
@@ -427,8 +452,8 @@ def format_focus_lots(results, symbols, as_of: datetime) -> str:
     rows.sort(key=lambda row: (row[0], row[1]))
     return (
         "**Taxable lots for focus names** (identify a lot by account and acquired date):\n\n"
-        "| Ticker | Acct | Acquired | Qty | Cost/share | Unrealized | Term |\n"
-        "|---|---|---|---:|---:|---:|---|\n" + "\n".join(row[2] for row in rows) + "\n"
+        "| Ticker | Acct | Acquired | Qty | Cost/share | Unrealized | Term | Turns LT in |\n"
+        "|---|---|---|---:|---:|---:|---|---|\n" + "\n".join(row[2] for row in rows) + "\n"
     )
 
 
@@ -437,6 +462,23 @@ def sleeve_stats(holdings: list[dict], symbols: tuple[str, ...], total: float):
     mv = sum(h["market_value"] for h in members)
     w = (mv / total * 100) if total else 0.0
     return mv, w, [h["symbol"] for h in members]
+
+
+def review_size(holding: dict) -> float:
+    """Dollar size for review floors: the larger of market value and cost basis.
+
+    Using market value alone meant a position that kept falling eventually dropped
+    below the floor and out of review: the worse the loss, the less visible it was.
+    """
+    return max(holding.get("market_value") or 0.0, holding.get("total_cost") or 0.0)
+
+
+def top5_noncash_weight(values: dict[str, float], total: float) -> float:
+    """Top-5 concentration over non-cash positions (cash is not concentration risk)."""
+    if total <= 0:
+        return 0.0
+    ranked = sorted((v for s, v in values.items() if not is_cash_symbol(s)), reverse=True)
+    return sum(ranked[:5]) / total * 100
 
 
 def taxable_harvest_reviews(results) -> list[dict]:
@@ -457,7 +499,7 @@ def taxable_harvest_reviews(results) -> list[dict]:
             market_value = holding.get("market_value") or 0.0
             total_gain = holding.get("total_gain")
             if (
-                market_value >= active_policy().analyze_market_value_floor
+                review_size(holding) >= active_policy().analyze_market_value_floor
                 and total_gain is not None
                 and total_gain < active_policy().harvest_loss_dollars
             ):
@@ -507,12 +549,11 @@ def must_analyze_holdings(
         if is_cash_symbol(sym):
             continue
         reasons: list[str] = []
-        mv = h.get("market_value") or 0.0
         if (h.get("weight") or 0.0) >= active_policy().analyze_weight_floor_pct:
             reasons.append("weight")
         tg = h.get("total_gain")
         tgp = h.get("total_gain_pct")
-        sized = mv >= active_policy().analyze_market_value_floor
+        sized = review_size(h) >= active_policy().analyze_market_value_floor
         if required_harvest_symbols is not None:
             harvest_required = sym in required_harvest_symbols
         else:
@@ -709,10 +750,11 @@ def format_marginal_10k(
         values[source_symbol] = values.get(source_symbol, 0.0) - amount
         destination_key = destination_symbol or "__NEW_NON_AI_DIVERSIFIER__"
         values[destination_key] = values.get(destination_key, 0.0) + amount
-        return sum(sorted(values.values(), reverse=True)[:5]) / grand_total * 100
+        return top5_noncash_weight(values, grand_total)
 
-    current_top5_w = sum(sorted((h["market_value"] for h in holdings), reverse=True)[:5])
-    current_top5_w = current_top5_w / grand_total * 100
+    current_top5_w = top5_noncash_weight(
+        {h["symbol"]: h["market_value"] for h in holdings}, grand_total
+    )
 
     def row(label, d_direct, d_broad, d_cash, d_top5, note):
         def fmt(x):
@@ -761,10 +803,7 @@ def format_marginal_10k(
             h["symbol"]: h["market_value"] - (amount if h["symbol"] == symbol else 0.0)
             for h in holdings
         }
-        top5_delta = (
-            sum(sorted(post_sale_values.values(), reverse=True)[:5]) / grand_total * 100
-            - current_top5_w
-        )
+        top5_delta = top5_noncash_weight(post_sale_values, grand_total) - current_top5_w
         rows.extend(
             [
                 "",
@@ -832,8 +871,7 @@ def build_briefing(
         if is_cash_symbol(h["symbol"])
     ) or "none"
 
-    top5 = holdings[:5]
-    top5_w = sum(h["weight"] for h in top5)
+    top5_w = top5_noncash_weight({h["symbol"]: h["market_value"] for h in holdings}, grand_total)
 
     breaches = [
         h
@@ -958,7 +996,9 @@ def build_briefing(
         candidate_instruction = "No new ideas today; the focus names come first."
         candidate_output = "Write **No candidate review today**."
 
+    briefing_id = make_briefing_id(as_of, today_snap)
     prompt = render_prompt_template(
+        briefing_id=briefing_id,
         output_mode=output_policy.mode,
         candidate_refresh="yes" if output_policy.refresh_candidates else "no",
         research_window=research_window,
@@ -1009,6 +1049,14 @@ def build_briefing(
         prompt=prompt.strip() + "\n",
         weights_snapshot=today_snap,
         observation_snapshot=today_observation,
+        meta={
+            "schema_version": 1,
+            "briefing_id": briefing_id,
+            "as_of": as_of.isoformat(),
+            "portfolio_file": f"portfolio_{as_of:%Y-%m-%d}.txt",
+            "focus_symbols": [symbol for symbol, _reasons in output_policy.focus_reasons],
+            "monitor_symbols": list(output_policy.monitor_symbols),
+        },
     )
 
 
@@ -1037,6 +1085,10 @@ def save_briefing_result(
     latest = OUT_DIR / "daily_briefing_prompt_latest.md"
     atomic_write_text(dated, result.prompt)
     atomic_write_text(latest, result.prompt)
+    if result.meta:
+        meta_text = json.dumps(result.meta, indent=2)
+        atomic_write_text(BRIEFINGS_DIR / f"briefing_{date_str}.json", meta_text)
+        atomic_write_text(BRIEFINGS_DIR / "briefing_latest.json", meta_text)
     save_weights_snapshot(result.weights_snapshot, as_of, BRIEFINGS_DIR)
     save_observation_snapshot(result.observation_snapshot, as_of, BRIEFINGS_DIR)
     return dated, latest
@@ -1058,6 +1110,11 @@ def main(argv=None) -> int:
     source.add_argument(
         "--input-file",
         help="Build offline from a portable payload file, or '-' for stdin.",
+    )
+    parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help=f"Accept offline input older than {MAX_OFFLINE_AGE_HOURS} hours.",
     )
     parser.add_argument(
         "--policy",
@@ -1088,11 +1145,24 @@ def _run(args, parser) -> int:
         formatted, grand_total, npos, results, as_of = parse_portable_portfolio_text(
             pasted
         )
+        age_hours = (now_et() - as_of).total_seconds() / 3600
+        if age_hours > MAX_OFFLINE_AGE_HOURS and not args.allow_stale:
+            print(
+                f"\nPortfolio data was observed {as_of:%Y-%m-%d %H:%M %Z} "
+                f"({age_hours:.0f} hours ago). Re-run get_portfolio.py, or pass "
+                "--allow-stale to build from old data deliberately.",
+                file=sys.stderr,
+            )
+            return 3
     else:
         print("Fetching live E*TRADE portfolio...")
         formatted, grand_total, npos, results, as_of = fetch_portfolio_block(
             verbose=True, allow_partial=args.allow_partial
         )
+        if not any(result.get("error") for result in results):
+            # Keep the structured payload so import_response.py can check a reply
+            # against exact accounts and lots.
+            formatted = format_portable_portfolio_text(formatted, results, as_of)
 
     holdings, accounts = consolidate(results, grand_total)
     result = build_briefing(
