@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -135,6 +136,15 @@ class ImportResponseTests(unittest.TestCase):
     @staticmethod
     def codes(checks, level=None):
         return [c["code"] for c in checks.items if level is None or c["level"] == level]
+
+    def test_crlf_reply_is_saved_with_lf_line_endings(self):
+        reply_file = Path(self._tmp.name) / "reply_crlf.txt"
+        reply_file.write_bytes(reply_text().replace("\n", "\r\n").encode("utf-8"))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = imp.main(["--engine", "claude", "--input-file", str(reply_file)])
+        self.assertEqual(code, 0)
+        saved = (self.responses / "2026-09-18_claude.md").read_bytes().decode("utf-8")
+        self.assertEqual(saved, reply_text().replace("\n", os.linesep))
 
     def test_valid_no_trade_reply_is_accepted_and_saved(self):
         code, out = self.run_import(reply_text())

@@ -601,7 +601,10 @@ def validate_reply(
     computed: dict = {"trades": [], "weights": None, "tax_summary": None}
     block = extract_json_block(reply)
     if block is None:
-        checks.error("no_json_block", "no ```json block (or bare JSON object with a briefing_id) found in the reply")
+        checks.error(
+            "no_json_block",
+            "no ```json block (or bare JSON object with a briefing_id) found in the reply",
+        )
         return checks, None, computed
     try:
         parsed = json.loads(block)
@@ -755,7 +758,7 @@ def format_report(status, checks, computed, engine, date_str) -> str:
     return "\n".join(lines)
 
 
-def _read_reply(args) -> str:
+def _read_raw_reply(args) -> str:
     if args.from_clipboard:
         return read_clipboard_text()
     if args.input_file == "-":
@@ -764,6 +767,12 @@ def _read_reply(args) -> str:
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16")
     return raw.decode("utf-8-sig", errors="replace")
+
+
+def _read_reply(args) -> str:
+    # Windows files and clipboard text use CRLF. Text-mode saves would turn
+    # each CRLF into CR CR LF, so normalize to LF before hashing or saving.
+    return _read_raw_reply(args).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _load_briefing(date_arg: str | None) -> tuple[dict, str]:
