@@ -601,7 +601,10 @@ def validate_reply(
     computed: dict = {"trades": [], "weights": None, "tax_summary": None}
     block = extract_json_block(reply)
     if block is None:
-        checks.error("no_json_block", "no ```json block (or bare JSON object with a briefing_id) found in the reply")
+        checks.error(
+            "no_json_block",
+            "no ```json block (or bare JSON object with a briefing_id) found in the reply",
+        )
         return checks, None, computed
     try:
         parsed = json.loads(block)
