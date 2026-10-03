@@ -13,5 +13,6 @@ Prices: Opus 5.5 $4 in / $20 out / $0.20 cache read; Sonnet 5.5 $2 / $10 / $0.20
 2026-10-02 | orchestration + checking delegated work | Opus 5.5 | inline | n/a | 4,957k / 19.8k | $1.93 | briefs, diff review, verification runs
 2026-10-02 | T9 /code-review high | Opus 5.5 | forked | 10 findings | 2,269k / ~3.0k | $1.12 | 7 fixed, 3 kept/skipped with reasons
 2026-10-02 | T9 triage + fixes + cost accounting | Opus 5.5 | inline | pass | 3,007k / 14.0k | $1.03 | 
+2026-10-03 | README technical-writing + unslop pass | Opus 5.5 | inline | pass | n/a | n/a | gate: one file already in context, no objective done-when
 
 Lessons: Opus 5.5 cache reads cost the same as Sonnet's ($0.20/MTok), so delegation saves only on output and cache writes. Each main-session turn re-read ~200k tokens of context. Doc-only edits are not worth delegating. Parallel agents can't see each other's changes (T4 options x T7 pricing), so an integration review is required.

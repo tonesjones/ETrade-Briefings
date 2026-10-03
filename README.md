@@ -1,25 +1,60 @@
-# E*TRADE → Daily Portfolio Action Briefing
+# E*TRADE daily portfolio briefing
 
-Pulls live E*TRADE positions (all active accounts), builds a **decision-support** briefing prompt (executive recommendations first, tax/lot hierarchy, factor sleeves), **copies it to your clipboard**, and saves a dated file. Paste it into your preferred capable model, such as ChatGPT, Grok, or Claude.
+This project pulls your live E\*TRADE positions from every active account and builds a briefing prompt for a language model. The script copies the prompt to your clipboard and saves a dated copy. You paste the prompt into a model with web search, such as Codex, ChatGPT, Grok, or Claude. Then you import the model's reply, and a validator checks every proposed trade against your actual positions.
 
-Each holding includes E\*TRADE **price paid**, **cost per share**, **total cost**, **unrealized P/L**, and **date acquired**. Taxable lots are labeled **ST** (held ≤ 1 year) or **LT** (held > 1 year). IRA/Roth show economic P/L but are **not** treated as capital-gains events. The prompt also pre-computes **direct AI/semi** vs **broad AI-cycle** weights so concentration is not just the six chip tickers.
+The project is read-only. It never places, previews, or cancels orders. You place any trade yourself in E\*TRADE.
 
----
+Each holding in the prompt carries E\*TRADE's price paid, cost per share, total cost, unrealized P/L, and date acquired. Taxable lots are marked ST (held one year or less) or LT (held more than one year). IRA and Roth accounts show economic P/L, but the prompt does not treat their sales as capital-gains events. The prompt also computes two concentration weights: the direct AI and semiconductor sleeve, and the broader AI-cycle sleeve. Concentration risk therefore covers more than the six chip tickers.
 
-## Daily workflow (recommended)
+## Set up once
 
-E\*TRADE access tokens **expire every day at midnight US Eastern**. You must re-authorize in the browser **once per calendar day** (Eastern) before pulling data. Same-day re-runs of the portfolio script do **not** need another browser login.
+1. Create a virtual environment and install the dependencies. `briefing.cmd` expects the environment at `.venv`.
 
-### 1. Re-auth (required after midnight ET, or if API rejects tokens)
+   ```powershell
+   cd path\to\etrade-briefings
+   python -m venv .venv
+   .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+
+2. Copy the secrets template:
+
+   ```powershell
+   copy .env.example .env
+   ```
+
+3. Add your E\*TRADE app keys to `.env`. Set `ETRADE_DEV=true` for the sandbox or `ETRADE_DEV=false` for production, and use the matching keys.
+
+   ```env
+   ETRADE_CONSUMER_KEY=...
+   ETRADE_CONSUMER_SECRET=...
+   ETRADE_DEV=false
+   ```
+
+4. Authorize the app. You repeat this step every day, as described in [Daily workflow](#daily-workflow).
+
+   ```powershell
+   python etrade_auth.py
+   ```
+
+The scripts pull every active account by default. To pull one account only, set `ETRADE_ACCOUNT_ID_KEY` in `.env`.
+
+## Daily workflow
+
+### 1. Re-authorize after midnight Eastern
+
+E\*TRADE access tokens expire at midnight US Eastern. This is an E\*TRADE rule, and the project can't work around it. Your consumer key and secret stay in `.env`. Only the access token pair needs refreshing.
 
 ```powershell
-cd path\to\etrade-briefings
 python etrade_auth.py
 ```
 
-1. Open the printed URL in your browser, log in, and authorize the app
-2. Paste the verification code into the terminal
-3. The script atomically updates the two daily token entries and `ETRADE_AUTH_DATE` in .env (token secrets are not printed by default)
+1. Open the URL that the script prints, log in, and authorize the app.
+2. Paste the verification code into the terminal.
+
+The script writes the two token entries and `ETRADE_AUTH_DATE` to `.env` in one atomic update. It doesn't print the token values.
+
+Later runs on the same Eastern day don't need a new login. If E\*TRADE rejects the tokens, or `ETRADE_AUTH_DATE` is from an earlier Eastern day, the scripts stop and tell you to run `etrade_auth.py` again.
 
 ### 2. Build the briefing prompt
 
@@ -27,277 +62,195 @@ python etrade_auth.py
 python build_briefing_prompt.py
 ```
 
-To build offline from the portable portfolio that `get_portfolio.py` copied to
-the clipboard, run the shortcut:
+The script copies the prompt to your clipboard. Open your model in a fresh chat, press **Ctrl+V**, and send.
+
+You can also build the prompt without contacting E\*TRADE. Run `get_portfolio.py` first, because it copies the portfolio and an embedded JSON payload to the clipboard. Then run the shortcut:
 
 ```powershell
 .\briefing.cmd
 ```
 
-The shortcut runs `build_briefing_prompt.py --from-clipboard` with the project
-virtual environment. Use the Python command directly when you need to call the
-builder from another script.
+`briefing.cmd` runs `build_briefing_prompt.py --from-clipboard` with the `.venv` interpreter. The offline build validates the versioned JSON payload and refuses older text-only dumps, because those dumps don't keep exact account and lot identity. It also refuses input older than 24 hours unless you pass `--allow-stale`.
 
-The offline path validates a versioned JSON payload embedded after the readable
-portfolio dump. It does not authenticate or contact E*TRADE. Legacy text-only
-dumps fail closed because they do not preserve exact account and lot identity.
-
-If another command overwrote the clipboard, build from the saved portfolio file
-instead:
+If another program replaced your clipboard, build from the saved portfolio file instead:
 
 ```powershell
 python build_briefing_prompt.py --input-file .\briefings\portfolio_YYYY-MM-DD.txt
 ```
 
-Replace `YYYY-MM-DD` with the date in the saved filename. This is a recovery
-path, not the normal daily command.
+### 3. Import the model's reply
 
-Then:
-
-1. Open your preferred model
-2. **Ctrl+V** — the full prompt is already on the clipboard
-3. Send
-
-### 3. Import the model's reply (recommended)
-
-The prompt asks the model to end with a fenced `json` block of its actions. Copy the model's whole reply, then run:
+The prompt asks the model to end its reply with a fenced `json` block of proposed actions. Copy the whole reply with the message's copy button, then run:
 
 ```powershell
 python import_response.py --engine codex --from-clipboard
 ```
 
-Use `--engine claude`, `chatgpt`, `grok`, or `other` to match the model you used. The script checks the reply against the exact portfolio data the prompt was built from: every focus name answered, tickers and accounts exist, quantities within the lot, cash available in the same account, wash-sale lookback across all accounts, and no adds to the direct AI/semi sleeve at its no-add level. It recomputes proceeds, realized gain per lot (ST/LT and days until long-term), and weights before and after. It prints ACCEPTED or REJECTED and saves the reply and checks under `responses/`. Treat a REJECTED reply's trades as unusable. Use `--input-file reply.md` instead of the clipboard if needed.
+Set `--engine` to the model you used: `codex`, `claude`, `chatgpt`, `grok`, or `other`. To import from a file, use `--input-file reply.md` in place of `--from-clipboard`.
 
-Notes:
+The importer checks the reply against the exact portfolio data that the prompt was built from:
 
-- Copy the **whole** reply (use the message's copy button), not just the json block. If the copy drops the ```` ``` ```` fences, the importer still finds the last JSON object that has a `briefing_id`.
-- `no_json_block` after that means the model did not write the block. Ask it to "end with the fenced json actions block exactly as the prompt specified" and import the new reply.
-- To re-check a reply you already saved, without copying it again: `python import_response.py --engine codex --input-file .\responses\YYYY-MM-DD_codex_N.md`. Each import saves under a new `_N` suffix; nothing is overwritten.
-- ACCEPTED means the trades are consistent with your positions, not that they are good ideas. Read the reasoning and the realized-gain / ST-LT numbers in the saved `.json` before placing anything.
+- The reply answers every focus name.
+- Every ticker and account exists.
+- Each sale quantity fits within the named lot.
+- Each account has the cash for its buys.
+- No buy creates a wash sale. The lookback covers all accounts.
+- No buy adds to the direct AI and semiconductor sleeve when the sleeve is at its no-add weight.
 
-### 4. Optional: compare two models
+The importer then recomputes proceeds, realized gain per lot, ST or LT status, days until long-term, and portfolio weights before and after. It prints `ACCEPTED` or `REJECTED`. Don't use any trade from a `REJECTED` reply.
 
-Paste the same prompt into two models (for example Codex and Claude) in fresh chats, and import each reply with its own `--engine`. Trades both recommend are the stronger signal; where they disagree, compare the reasoning and the tax impact in each `responses/*.json`. Ignore a REJECTED reply's trades.
+`ACCEPTED` means the trades fit your positions. It doesn't mean they are good trades. Read the reasoning, and read the realized-gain numbers in the saved `.json`, before you place anything.
 
-### Running it from a local Claude Code session
+The importer saves each reply to `responses/YYYY-MM-DD_<engine>.md` and `.json`. Another import on the same day adds a suffix, such as `_2`, so nothing is overwritten. To re-check a saved reply, pass that file:
 
-Run `claude` in the project folder (or open it in the Claude desktop app's Code tab). Claude can then run the build and import scripts, read `responses/`, and compare the models' replies for you. You still do the browser login for `etrade_auth.py`, paste the prompt into any outside model, and place trades yourself in E\*TRADE.
+```powershell
+python import_response.py --engine codex --input-file .\responses\YYYY-MM-DD_codex.md
+```
 
-### Getting updates
+If the copy dropped the code fences, the importer still finds the last JSON object that has a `briefing_id`. If it reports `no_json_block`, the model didn't write the block. Ask the model to "end with the fenced json actions block exactly as the prompt specified", then import the new reply.
 
-The default branch is `master`:
+### 4. Compare two models (optional)
+
+Paste the same prompt into two models in fresh chats, and import each reply with its own `--engine`. A trade that both models propose is a stronger signal. Where they disagree, compare the reasoning and the tax impact in each `responses/*.json` file.
+
+### Run the workflow from Claude Code
+
+Run `claude` in the project folder, or open the folder in the Code tab of the Claude desktop app. Claude can run the build and import scripts, read `responses/`, and compare replies for you. You still log in for `etrade_auth.py`, paste the prompt into the outside model, and place trades in E\*TRADE.
+
+### Get updates
+
+The default branch is `master`.
 
 ```powershell
 git pull origin master
 ```
 
-After pulling, rebuild the prompt before sending it to a model, so the reply follows the current contract.
+After you pull, rebuild the prompt before you send it, so the model's reply matches the current JSON contract.
 
-**Portfolio dump only** (local diagnostic, or if you keep a fixed system prompt in your model):
-
-```powershell
-python get_portfolio.py
-```
-
-The daily briefing prompt does **not** reprint that dump. Lots appear once, in a single taxable + IRA + Roth table.
-
-### Outputs each run
+## What each command writes
 
 | Command | Output |
 |---------|--------|
-| `build_briefing_prompt.py` | Compact decision-support prompt → clipboard + dated prompt + `weights_*.json` portfolio deltas + `observations_*.json` account/quantity/lot reconciliation |
-| `briefing.cmd` | Offline compact decision-support prompt from the structured clipboard payload → clipboard + dated prompt + snapshots |
-| `get_portfolio.py` | Full per-account dump (cost / P/L / ST-LT) → clipboard + `briefings/portfolio_YYYY-MM-DD.txt` — local diagnostic, not pasted into the model |
-| `import_response.py` | Validated reply → `responses/YYYY-MM-DD_<engine>.md` + `.json` (checks, computed trades, weights) |
+| `build_briefing_prompt.py` | Prompt to the clipboard and `prompts/`. Writes `briefings/weights_*.json` (portfolio delta) and `briefings/observations_*.json` (account, quantity, and lot reconciliation). |
+| `briefing.cmd` | The same outputs, built offline from the clipboard payload. |
+| `get_portfolio.py` | Full per-account dump with cost, P/L, and ST or LT status, to the clipboard and `briefings/portfolio_YYYY-MM-DD.txt`. For diagnostics and offline builds. Don't paste it into the model. |
+| `import_response.py` | `responses/YYYY-MM-DD_<engine>.md` and `.json`, with the checks, computed trades, and weights. |
 
-### What the briefing asks the model to analyze
+## What the prompt asks the model to do
 
-The prompt is a **decision-support engine**, not a holdings dump. It is written for a model with web search (for example Codex). The model has no trading authority and its output is an analytical proposal, not an approved or submitted trade. It is asked to:
+The prompt asks for decision support, not a holdings summary. It assumes a model with web search. The model has no trading authority, and its output is a proposal, not an approved trade. The model must:
 
-- **Research first**: search for dated news on each focus name since the last snapshot, check the market backdrop, and scan the monitor-only names for material events. "No material news" counts as evidence.
-- Work from **one focus list**: each name carries its reason (limit breach, taxable loss review, weight or position change, or size and loss on a decision day). Other sized holdings are monitor-only.
-- Give each focus name a **Fundamental View** and, separately, one **Portfolio Action** (KEEP / REDUCE / REPLACE / DEPLOY / NO ACTION). NO ACTION is reserved for a named missing fact that would change the decision.
-- Treat a soft concentration breach as **review + no-add**, not an automatic sale, and start any limit-driven cut from the pre-computed **smallest dollar cut**
-- Name the account and **exact taxable lot** for any sale (lots for focus names are included) and respect **wash-sale** rules on taxable losses
-- Cite every company-specific fact with its **source and date**, and replace vague horizons with observable triggers
-- Reconcile prior proposals when a decision history is supplied
+- Research first. For each focus name, find dated news since the last snapshot. Check the market backdrop, and scan the monitor-only names for material events. "No material news" counts as a finding.
+- Work from one focus list. Each focus name carries its reason: a limit breach, a taxable loss to review, a weight or position change, or size and loss on a decision day. Other sized holdings are monitor-only.
+- Give each focus name a fundamental view and, separately, one portfolio action: `KEEP`, `REDUCE`, `REPLACE`, `DEPLOY`, or `NO ACTION`. `NO ACTION` requires a named missing fact that would change the decision.
+- Treat a soft concentration breach as "review and don't add", not as an automatic sale. Any cut for a limit starts from the computed smallest dollar cut.
+- Name the account and the exact taxable lot for every sale, and respect wash-sale rules on taxable losses.
+- Cite the source and date of every company-specific fact. Replace vague time horizons with observable triggers.
+- Reconcile earlier proposals when a decision history is supplied.
 
-Blocks with nothing to say (no research notes, no decision history, the $10k example on routine days) are left out of the prompt.
+The prompt leaves out empty sections, such as research notes when you have none, or the $10k example table on routine days. Each lot appears once, in a single table that covers taxable, IRA, and Roth accounts.
 
-It injects two independent deltas:
+The prompt includes two deltas against the previous pull:
 
-- A **portfolio delta** vs the prior pull (weight moves ≥ 0.5 pp, factor sleeves, 15% breaches)
-- An **observed account delta** using per-account quantities and lot identity (position appeared/disappeared, quantity increased/decreased, lot identity changed, or no execution detected)
+- The portfolio delta shows weight moves of 0.5 percentage points or more, sleeve weights, and breaches of the 15% single-name cap.
+- The account delta compares per-account quantities and lot identity. It reports a position that appeared or disappeared, a quantity that rose or fell, a lot that changed, or no change.
 
-Observed E*TRADE changes establish that account values changed, but without transaction or order evidence they do not prove a buy or sale; transfers, splits, and other corporate actions can also change positions. They do not establish motive or whether a prior model proposal was approved. The clipboard workflow also cannot capture the model response automatically, so prior model proposals remain `NOT CAPTURED` unless a future response-import/API layer supplies them.
+The account delta shows that holdings changed. It doesn't prove a buy or a sale, because transfers, splits, and other corporate actions also change positions. It also doesn't show why a holding changed, or whether you acted on a model's proposal. The prompt marks earlier proposals `NOT CAPTURED` unless your decision history records them.
 
----
+The deltas compare against the most recent earlier calendar day, not an earlier run on the same day. They need a previous `briefings/weights_*.json` or dated prompt.
 
-## Token lifetime (why re-auth is daily)
+## Change the decision policy
 
-| Situation | What you do |
-|-----------|-------------|
-| **First use, or any time after midnight US Eastern** | Run python etrade_auth.py, authorize, and paste the code; tokens are saved automatically |
-| **Same day, tokens still working** | Just run `build_briefing_prompt.py` / `get_portfolio.py` — no browser |
-| **API rejects tokens** (expired or invalid) | The scripts stop with a "run etrade_auth.py" message — run it again |
+The briefing math and most of the prompt's instructions read `portfolio_policy.json`. When a cap, sleeve, or threshold changes, edit that file, not the Python. `--policy path.json` makes `build_briefing_prompt.py`, `get_portfolio.py`, or `import_response.py` load a different policy file. `schema_version` must stay `1`. The loader stops if a required sleeve is missing.
 
-This is an E\*TRADE platform rule, not something this repo can skip. Consumer key/secret stay in `.env` permanently; only the **access** token pair must be refreshed after daily expiry.
-
----
-
-## One-time setup
-
-### 1. Install
-
-```powershell
-cd path\to\etrade-briefings
-pip install -r requirements.txt
-```
-
-### 2. Configure secrets
-
-```powershell
-copy .env.example .env
-```
-
-Edit `.env` with your E*TRADE app keys:
-
-```env
-ETRADE_CONSUMER_KEY=...
-ETRADE_CONSUMER_SECRET=...
-ETRADE_DEV=true          # sandbox; use false for production
-```
-
-### 3. First OAuth (then again after each midnight ET)
-
-```powershell
-python etrade_auth.py
-```
-
-Authorize in the browser and paste the verification code. The script saves the daily tokens to .env without printing them.
-See [Daily workflow](#daily-workflow-recommended) — you will repeat this step **once per day** after tokens expire.
-
-### 4. Accounts
-
-By default the script pulls **all ACTIVE** accounts.  
-Optional: pin one account with `ETRADE_ACCOUNT_ID_KEY=...` in `.env`.
-
----
-
-## Files
-
-| File | Role |
-|------|------|
-| `build_briefing_prompt.py` | **Daily command** — live portfolio + decision-engine prompt → clipboard |
-| `briefing.cmd` | One-command offline briefing shortcut using the structured clipboard payload |
-| `get_portfolio.py` | Portfolio block only, including cost / P/L / ST-LT |
-| `import_response.py` | Validates a model reply against the briefing's portfolio data and saves it |
-| etrade_auth.py | OAuth plus atomic .env token update — once per day after midnight ET |
-| `templates/briefing_prompt.md` | Wording of the briefing prompt (`{placeholders}` are filled by `build_briefing_prompt.py`) |
-| `briefing_snapshots.py` | Daily weight / observation snapshots and the two deltas |
-| `briefing_formatting.py` | Shared money / weight formatting |
-| `portfolio_policy.json` | Decision limits, sleeves, harvest floors, $10k examples |
-| `portfolio_policy.py` | Loads and validates that JSON (`--policy path.json` on either script uses another file) |
-| `docs/history-retention.md` | Notes on how much briefing history to keep |
-| `portfolio_context.example.json` | Template for local owner constraints, dated research, and prior analytical proposals |
-| `.env` | Secrets (gitignored) |
-| `.env.example` | Template for secrets |
-| `briefings/` | Dated portfolio blocks + weight and observation snapshots (gitignored) |
-| `prompts/` | Dated full briefing prompts (gitignored) |
-
----
-
-## Editing the decision policy
-
-All briefing math and most instruction text read `portfolio_policy.json`. Edit that file — not the Python — when a cap, sleeve, or analysis floor changes. Then run:
-
-    python -m unittest discover -s tests -v
-
-To change the wording of the prompt itself, edit `templates/briefing_prompt.md`; placeholders in `{braces}` are filled with computed values.
-
-| Key | What it does |
-|-----|----------------|
-| `single_name_cap_pct` | Soft max weight for one liquid name. Breaches get a minimum-dollar cut. |
-| `cluster_do_not_increase_pct` | Direct AI/semi: do not add at or above this weight. |
-| `cluster_soft_cap_pct` | Direct AI/semi soft ceiling. Holding above it is allowed only when cutting would realize punitive ST tax. |
+| Key | Effect |
+|-----|--------|
+| `single_name_cap_pct` | Soft maximum weight for one liquid name. A breach gets a minimum-dollar cut. |
+| `cluster_do_not_increase_pct` | Direct AI and semiconductor sleeve: no buys at or above this weight. |
+| `cluster_soft_cap_pct` | Direct AI and semiconductor sleeve soft ceiling. Holding above it is allowed only when a cut would realize a costly short-term gain. |
 | `analyze_weight_floor_pct` | Names at or above this weight must appear in the position table. |
-| `analyze_market_value_floor` | Dollar floor before harvest / material-loss names are forced into the table. |
-| `material_loss_dollars` / `material_loss_pct` | Sized names past either loss threshold stay in the table even under the weight floor. |
-| `harvest_loss_dollars` | Taxable unrealized-loss flag (negative number). |
-| `risk_off_glide_pct` | Direct-stack weight to work *toward* in Risk-Off, via tax-aware lots. |
-| `st_gain_flag_dollars` / `lt_gain_flag_dollars` | Taxable ST / LT unrealized-gain flags in the live tax block. |
-| `cash_symbols` | Tickers treated as cash (plus any symbol containing `GOVERNMENT`). |
-| `sleeves` | Factor membership. Direct AI/semi is a subset of broad AI-cycle. Changing membership changes both the math and the prompt labels. |
-| `aliases` | Optional display names (`CRWV` → CoreWeave). |
-| `marginal_examples` | Rows in the pre-computed $10k table. `symbol` may be `null` for a generic diversifier. |
+| `analyze_market_value_floor` | Minimum market value before a harvest or material-loss name must appear in the table. |
+| `material_loss_dollars`, `material_loss_pct` | A sized name past either loss threshold stays in the table, even under the weight floor. |
+| `harvest_loss_dollars` | Taxable unrealized-loss flag. Use a negative number. |
+| `risk_off_glide_pct` | Direct-sleeve weight to work toward in Risk-Off, using tax-aware lots. |
+| `st_gain_flag_dollars`, `lt_gain_flag_dollars` | Taxable short-term and long-term unrealized-gain flags in the tax section. |
+| `cash_symbols` | Tickers treated as cash. Any symbol that contains `GOVERNMENT` also counts as cash. |
+| `sleeves` | Sleeve membership. The direct AI and semiconductor sleeve is a subset of the broad AI-cycle sleeve. A membership change updates both the math and the prompt labels. |
+| `aliases` | Optional display names, for example `CRWV` shown as CoreWeave. |
+| `marginal_examples` | Rows in the $10k example table. Set `symbol` to `null` for a generic diversifier. |
 
-`schema_version` must stay `1`. Missing required sleeves abort load.
+To change the prompt's wording, edit `templates/briefing_prompt.md`. `build_briefing_prompt.py` fills each `{placeholder}` with a computed value.
 
-## Research continuity
+After either change, run the tests:
 
-Copy `portfolio_context.example.json` to `portfolio_context.json` and fill it in locally. The daily prompt reads this optional file and keeps it out of Git. It has three deliberately small sections:
+```powershell
+python -m unittest discover -s tests -v
+```
 
-- `owner_profile`: horizon, cash reserve, withdrawal, tax, and hard-limit facts that the broker cannot supply.
-- `research`: one dated record per held name or recurring candidate, including the valuation or entry condition, decision trigger, metrics, and primary sources.
-- `decision_history`: prior analytical proposals and their conditions. Record approval or confirmed execution only when you have that evidence; a model recommendation itself is not approval.
+## Keep research between days
 
-All three sections are optional. A blank owner profile is reported as "not supplied", and the model flags a missing field only where it would change a trade. Research notes give the model a starting point; without them it researches each focus name itself. Keep notes concise and update them after earnings or a material event.
+To give the model context that E\*TRADE can't supply, copy `portfolio_context.example.json` to `portfolio_context.json` and fill it in. Git ignores the file. All three sections are optional:
 
----
+- `owner_profile` holds your horizon, cash reserve, withdrawals, tax facts, and hard limits.
+- `research` holds one dated record per held name or recurring candidate: the valuation or entry condition, the decision trigger, metrics, and primary sources.
+- `decision_history` holds earlier proposals and their conditions. Record an approval or an execution only when you have evidence of it. A model's recommendation is not an approval.
 
-## Read-only / no trading without consent
+The prompt reports a blank owner profile as "not supplied", and the model flags a missing field only where it would change a trade. Without research notes, the model researches each focus name itself. Update the notes after earnings or a material event.
 
-This project is intentionally **read-only** against E\*TRADE:
+## Data completeness
 
-| Allowed | Not present in this repo |
-|---------|---------------------------|
-| OAuth login (`etrade_auth.py`) | `ETradeOrder` (place / preview / cancel orders) |
-| `list_accounts` | Market order helpers used to trade |
-| `get_account_portfolio` (including cost basis / lots) | Any auto-submit of buys/sells |
+The scripts fetch every page of positions and the account balance. The weight denominator is total account value, including residual cash. Each account must reconcile before the scripts build a prompt:
 
-- Model recommendations from the briefing prompt are **text only**. Nothing in this repo sends those actions to E\*TRADE.
-- You would have to place trades yourself in the E\*TRADE UI (or deliberately add order code later).
-- OAuth tokens can technically authorize trading APIs if misused, but **this codebase never calls order endpoints**.
+- Positions plus cash match the reported account value, within five basis points to allow for mark timing.
+- Each holding's tax lots add up to its share quantity.
 
----
+A malformed response, a missing or mismatched lot, an account that doesn't reconcile, or a failed account pull stops the build. The scripts never shrink the portfolio silently.
 
-## Tips
+The scripts retry only network errors, throttling (HTTP 429), and server errors (5xx). An expired token (HTTP 401) stops the run with a message to re-authorize.
 
-- **Daily live habit:** after midnight ET, run `etrade_auth.py`, run `build_briefing_prompt.py`, open your preferred model, and press Ctrl+V.
-- **Daily offline habit:** run `get_portfolio.py`, run `briefing.cmd`, open your preferred model, and press Ctrl+V.
-- Cost basis: both scripts pull E\*TRADE average cost, total cost, unrealized P/L, and **tax lots** (so mixed ST/LT names are split correctly). That adds a few extra read-only lot calls and a few seconds.
-- Daily delta needs yesterday’s `briefings/weights_*.json` (or a prior dated prompt). Same-day re-runs compare to the last *previous calendar day*, not the earlier run today.
-- Same calendar day (US Eastern): re-run the portfolio script without re-auth unless the API rejects tokens.
-- Production: `ETRADE_DEV=false` with LIVE consumer key/secret in `.env`.
+For diagnostics only, `--allow-partial` makes `get_portfolio.py` or `build_briefing_prompt.py` produce a clearly marked incomplete result. Don't size trades from partial output.
 
----
+Holding periods come from each lot's acquired date. E\*TRADE doesn't document the lot `termCode` field, so the scripts use it only when the date is missing, and the lot table flags any disagreement. Option positions stay separate from their underlying stock and show at market value. The scripts don't compute option delta exposure.
 
-## Data completeness and safety
-
-The scripts fetch every page of portfolio positions and the read-only E*TRADE account balance. The account value—including residual cash—is the weight denominator. Each account must reconcile: positions plus cash must match the reported account value (within five basis points for mark timing), and each holding's tax lots must add up to its share quantity. Response-shape errors, missing or mismatched tax lots, an unreconciled account, or a failed selected account stop prompt generation rather than silently shrinking the portfolio.
-
-Only network errors, throttling (429), and server errors (5xx) are retried. An expired token (401), or an `ETRADE_AUTH_DATE` from an earlier Eastern day, stops immediately with a re-authorize message.
-
-For diagnostics only, use the --allow-partial option with either portfolio command to produce a prominently marked incomplete result. Do not use partial output for trade sizing.
-
-Decision rules live in portfolio_policy.json, including concentration limits, factor sleeves, analysis thresholds, and aliases.
-
-Run the offline regression suite with:
-
-    python -m unittest discover -s tests -v
-
-OAuth tokens are saved automatically. Use --no-write-env together with --print-tokens only when manual token handling is explicitly needed.
-
-Holding periods come from each lot's acquired date. E*TRADE's lot `termCode` is undocumented, so it is used only when the date is missing, and the lot table marks any disagreement for review. Offline input older than 24 hours is refused unless you pass `--allow-stale`. Option positions are kept separate from their underlying stock and shown at market value; their delta exposure is not computed.
+Lot detail costs a few extra read-only API calls per run, which adds a few seconds.
 
 ## Security
 
-- **`.env` is gitignored** (and `.env.*` except `.env.example`) — safe to push the repo to GitHub without uploading keys
-- Before first push, confirm: `git check-ignore -v .env` should print a match
-- Never hard-code API keys
-- `briefings/`, `prompts/`, and `responses/` are gitignored (position data is sensitive)
-- Commit `.env.example` only (placeholders), not real values
-- Keep the GitHub remote **private**. Never `git add -f` `.env`, `briefings/`, or `prompts/`
-- Local artifacts are the real book: dollars, cost, lots, and account last-4s. Do not zip `briefings/` or `prompts/` into email, a public gist, or a cloud chat
-- The model you paste into sees the full prompt — that is the workflow, not a leak in this repo
-- Lint: `pip install ruff` then `ruff check .` (CI runs lint and tests on every push)
+The local output is your real portfolio: dollar values, cost basis, lots, and the last four digits of each account number. Treat it that way.
+
+- Git ignores `.env`, `.env.*` (except `.env.example`), `briefings/`, `prompts/`, `responses/`, and `portfolio_context.json`. Before your first push, run `git check-ignore -v .env`. It must print a match.
+- Never run `git add -f` on an ignored file. Commit only `.env.example`, with placeholders.
+- Never hard-code API keys.
+- Keep the GitHub repository private.
+- Don't send `briefings/` or `prompts/` by email, a public gist, or a cloud chat. The model you paste into sees the full prompt. That exposure is the workflow, not a leak.
+- `etrade_auth.py` saves tokens to `.env` without printing them. Pass `--no-write-env` with `--print-tokens` only when you need to handle tokens by hand.
+- The OAuth tokens could authorize E\*TRADE's trading APIs. This code never calls an order endpoint. It uses only the OAuth login, `list_accounts`, and `get_account_portfolio`.
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `build_briefing_prompt.py` | Daily command. Builds the prompt from live data or a saved portfolio. |
+| `briefing.cmd` | Offline build from the clipboard payload. |
+| `get_portfolio.py` | Portfolio dump with cost, P/L, and ST or LT status. |
+| `import_response.py` | Validates a model reply against the briefing's portfolio data and saves it. |
+| `etrade_auth.py` | OAuth login and atomic `.env` token update. |
+| `templates/briefing_prompt.md` | Prompt wording, with `{placeholders}`. |
+| `briefing_snapshots.py` | Daily weight and observation snapshots, and the two deltas. |
+| `briefing_formatting.py` | Shared money and weight formatting. |
+| `portfolio_policy.json` | Limits, sleeves, harvest thresholds, and $10k examples. |
+| `portfolio_policy.py` | Loads and validates `portfolio_policy.json`. |
+| `portfolio_context.example.json` | Template for owner constraints, dated research, and earlier proposals. |
+| `docs/history-retention.md` | How much briefing history to keep. |
+| `.env.example` | Secrets template. |
+| `briefings/`, `prompts/`, `responses/` | Local output. Git ignores these folders. |
+
+## Develop
+
+CI runs lint and the test suite on every push. To run both locally:
+
+```powershell
+pip install ruff
+ruff check .
+python -m unittest discover -s tests -v
+```
